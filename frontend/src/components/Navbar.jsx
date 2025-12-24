@@ -2,7 +2,7 @@ import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
-import { Sun, Moon, LogOut, Home, Key, BarChart, MessageSquare } from 'lucide-react';
+import { Sun, Moon, LogOut, Home, Key, BarChart, MessageSquare, Book } from 'lucide-react';
 
 const Navbar = () => {
   const { user, logout } = useAuth();
@@ -34,6 +34,13 @@ const Navbar = () => {
           </div>
 
           <div className="flex items-center space-x-4">
+            <Link
+              to="/docs"
+              className="flex items-center space-x-1 text-gray-700 dark:text-gray-200 hover:text-primary-600 dark:hover:text-primary-400"
+            >
+              <Book className="h-5 w-5" />
+              <span>API Docs</span>
+            </Link>
             {user && (
               <>
                 <Link

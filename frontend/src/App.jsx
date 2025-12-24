@@ -8,6 +8,7 @@ import SignIn from './pages/SignIn';
 import UserDashboard from './pages/UserDashboard';
 import AdminDashboard from './pages/AdminDashboard';
 import Playground from './pages/Playground';
+import ApiDocs from './pages/ApiDocs';
 
 // Protected Route Component
 const ProtectedRoute = ({ children, requireAdmin = false }) => {
@@ -51,6 +52,7 @@ function AppContent() {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/signin" element={<SignIn />} />
+          <Route path="/docs" element={<ApiDocs />} />
           <Route
             path="/dashboard"
             element={
