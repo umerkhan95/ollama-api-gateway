@@ -1,0 +1,27 @@
+<svg width="300" height="80" viewBox="0 0 300 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Logo Icon -->
+  <circle cx="40" cy="40" r="30" fill="url(#logoGradient)"/>
+  
+  <defs>
+    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4F46E5;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#7C3AED;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- API Symbol -->
+  <path d="M40 25 L48 29 L48 37 L40 41 L32 37 L32 29 Z" fill="white" opacity="0.9"/>
+  <path d="M40 41 L48 45 L48 53 L40 57 L32 53 L32 45 Z" fill="white" opacity="0.9"/>
+  <line x1="40" y1="25" x2="40" y2="41" stroke="white" stroke-width="2"/>
+  <line x1="48" y1="29" x2="48" y2="45" stroke="white" stroke-width="2"/>
+  <line x1="32" y1="29" x2="32" y2="45" stroke="white" stroke-width="2"/>
+  <circle cx="40" cy="41" r="4" fill="white"/>
+  
+  <!-- Text -->
+  <text x="85" y="35" font-family="Arial, sans-serif" font-size="20" font-weight="bold" fill="#1F2937">
+    Ollama API
+  </text>
+  <text x="85" y="55" font-family="Arial, sans-serif" font-size="16" fill="#6B7280">
+    Gateway
+  </text>
+</svg>

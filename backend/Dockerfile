@@ -8,7 +8,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY main.py .
-COPY .env.example .env
+COPY database.py .
+
+# Note: Environment variables are provided by docker-compose.yml from root .env file
+# No need to copy .env file into the container
 
 # Expose port
 EXPOSE 8000
