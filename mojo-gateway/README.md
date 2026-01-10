@@ -1,15 +1,49 @@
-# 🔥 Mojo Gateway - High-Performance LLM API Gateway
+# Mojo Gateway - High-Performance LLM Inference Engine
 
-A proof-of-concept high-performance API gateway for LLM inference, written in **Mojo** with **MAX Engine** integration.
+A high-performance LLM inference engine written in **Mojo**, featuring T-MAC (Table Lookup-based) inference for extreme memory efficiency.
 
 ## Overview
 
-This Mojo Gateway is designed to replace the Python-based Ollama API Gateway with a high-performance alternative that can achieve:
+This project provides multiple LLM inference implementations optimized for different use cases:
 
-- **10-35,000x faster** compute operations compared to Python
-- **70% lower latency** for first-token generation
-- **60-80% cost reduction** through efficient resource utilization
-- **Zero-overhead abstractions** with compile-time type checking
+- **T-MAC Inference** - 16x memory compression using lookup tables (no multiplication!)
+- **SIMD Optimized** - Vectorized operations for maximum throughput
+- **Int4 Quantized** - 7x memory reduction with good quality
+- **API Gateway** - Production-ready HTTP server with auth and rate limiting
+
+### Performance Highlights
+
+| Implementation | Speed | Memory | Compression |
+|---------------|-------|--------|-------------|
+| Float32 SIMD | 29 tok/s | 418 MB | 1x |
+| Int4 Quantized | 13 tok/s | 62 MB | 7.1x |
+| **T-MAC v2** | **17 tok/s** | **27 MB** | **15.7x** |
+
+**T-MAC enables running 7x larger models in the same memory footprint.**
+
+## T-MAC: Multiplication-Free Inference
+
+T-MAC eliminates multiplication in matrix operations using precomputed lookup tables:
+
+```
+Traditional: output[i] = Σ weight[i,j] × activation[j]  // Expensive
+T-MAC:       output[i] = Σ LUT[group, weight_pattern]   // Just lookups!
+```
+
+### Quick Start with T-MAC
+
+```bash
+# Quantize model to T-MAC format
+python scripts/quantize_tmac_v2.py model.bin model.tmac2.bin
+
+# Build inference engine
+mojo build -O3 src/llama2_tmac_v2.mojo -o llama2_tmac
+
+# Run inference
+./llama2_tmac model.tmac2.bin -z tokenizer.bin -n 128 -t 0.8
+```
+
+See [README_TMAC.md](README_TMAC.md) for detailed T-MAC documentation.
 
 ## Architecture
 
@@ -181,35 +215,25 @@ print(response.choices[0].message.content)
 
 ```
 mojo-gateway/
-├── mojoproject.toml           # Project configuration
-├── Dockerfile                 # Multi-stage Docker build
-├── docker-compose.yml         # Docker Compose configuration
 ├── README.md                  # This file
-└── src/
-    ├── main.mojo              # Entry point
-    ├── router.mojo            # HTTP request router
-    ├── handlers/
-    │   ├── health.mojo        # Health check handlers
-    │   ├── generate.mojo      # Text generation handler
-    │   ├── chat.mojo          # Chat completion handler
-    │   ├── models.mojo        # Models list handler
-    │   ├── keys.mojo          # API key management
-    │   └── stats.mojo         # Statistics handlers
-    ├── auth/
-    │   ├── jwt.mojo           # JWT authentication
-    │   └── api_key.mojo       # API key management
-    ├── middleware/
-    │   ├── rate_limiter.mojo  # Rate limiting
-    │   └── logging.mojo       # Request logging
-    ├── inference/
-    │   └── max_engine.mojo    # MAX Engine integration
-    ├── models/
-    │   ├── request.mojo       # Request models
-    │   └── response.mojo      # Response models
-    └── utils/
-        ├── config.mojo        # Configuration
-        ├── json.mojo          # JSON utilities
-        └── simd_stats.mojo    # SIMD statistics
+├── README_TMAC.md             # T-MAC detailed documentation
+├── src/
+│   ├── llama2_tmac.mojo       # T-MAC v1: Pure ternary inference
+│   ├── llama2_tmac_v2.mojo    # T-MAC v2: Scaled ternary (better quality)
+│   ├── llama2_parallel.mojo   # Float32 SIMD parallel inference
+│   ├── llama2_simd.mojo       # Float32 SIMD inference
+│   ├── llama2_int4.mojo       # Int4 quantized inference
+│   ├── llama2.mojo            # Basic inference
+│   ├── main.mojo              # API Gateway entry point
+│   ├── auth/                  # Authentication modules
+│   ├── middleware/            # Rate limiting, logging
+│   └── utils/                 # Utilities
+├── scripts/
+│   ├── quantize_tmac.py       # T-MAC v1 quantization
+│   ├── quantize_tmac_v2.py    # T-MAC v2 quantization (with scales)
+│   ├── quantize_int4.py       # Int4 quantization
+│   └── benchmark_all.sh       # Benchmark script
+└── inference/                 # Additional inference utilities
 ```
 
 ## Performance Comparison
@@ -223,14 +247,23 @@ mojo-gateway/
 
 ## Roadmap
 
+### Completed
+- [x] T-MAC lookup table inference (16x compression)
+- [x] Int4 quantization (7x compression)
+- [x] SIMD vectorized inference
+- [x] Parallel multi-core inference
+- [x] Per-row scaled ternary (T-MAC v2)
+
+### In Progress
+- [ ] GPTQ-style calibration for better quality
+- [ ] Quantization-aware fine-tuning
+- [ ] Training scripts for ternary models
+
+### Planned
 - [ ] Streaming responses (SSE)
+- [ ] SIMD-optimized LUT (TBL/PSHUF instructions)
 - [ ] Batch inference
-- [ ] Model caching
-- [ ] Distributed rate limiting (Redis)
-- [ ] Persistent logging (PostgreSQL)
 - [ ] WebSocket support
-- [ ] gRPC interface
-- [ ] Model quantization support
 
 ## Contributing
 
@@ -243,5 +276,7 @@ MIT License - see LICENSE file for details.
 ## Acknowledgments
 
 - [Modular](https://www.modular.com/) - Mojo language and MAX Engine
+- [T-MAC Paper](https://arxiv.org/abs/2407.00088) - Table lookup inference algorithm
+- [BitNet b1.58](https://arxiv.org/abs/2402.17764) - Ternary weight training research
+- [llama2.c](https://github.com/karpathy/llama2.c) - Reference implementation
 - [Lightbug](https://github.com/Lightbug-HQ/lightbug_http) - Mojo HTTP framework
-- Original Ollama API Gateway team
