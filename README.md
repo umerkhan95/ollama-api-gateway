@@ -1,8 +1,8 @@
-# 🚀 Ollama API Gateway
+# EdgeLLM API Gateway
 
-> **Secure, scalable, and monitored access to Ollama AI models with a modern React dashboard**
+> **High-performance LLM inference with deterministic latency for edge devices with a modern React dashboard**
 
-A production-ready API gateway for Ollama with FastAPI backend, PostgreSQL database, React frontend, and comprehensive monitoring. Features role-based access control, usage analytics, rate limiting, and an interactive playground for testing AI models.
+A production-ready API gateway for EdgeLLM with FastAPI backend, PostgreSQL database, React frontend, and comprehensive monitoring. Features role-based access control, usage analytics, rate limiting, and an interactive playground for testing AI models with **15.5x lower latency jitter** than traditional inference.
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
@@ -12,7 +12,17 @@ A production-ready API gateway for Ollama with FastAPI backend, PostgreSQL datab
 
 ---
 
-## 📸 Screenshots
+## Key Advantages
+
+| Metric | EdgeLLM | Traditional |
+|--------|---------|-------------|
+| **Latency Jitter** | 373 ms | 5,799 ms |
+| **Model Size** | 40 MB | 91 MB |
+| **Min Hardware** | $15 Pi Zero | $800+ PC |
+
+---
+
+## Screenshots
 
 ### Home Page
 ![Home Page](./assets/home.png)
@@ -22,45 +32,45 @@ A production-ready API gateway for Ollama with FastAPI backend, PostgreSQL datab
 
 ---
 
-## ✨ Key Features
+## Key Features
 
-### 🔐 Security & Authentication
+### Security & Authentication
 - **API Key Authentication** - Secure Bearer token authentication
 - **Role-Based Access Control** - Admin and user roles with different permissions
 - **Secure Key Generation** - Cryptographically secure key generation
 - **Rate Limiting** - Configurable per-user hourly limits
 
-### 📊 Monitoring & Analytics
+### Monitoring & Analytics
 - **Usage Tracking** - Detailed statistics for requests and response times
 - **Admin Dashboard** - View all users' request patterns
 - **User Analytics** - Personal usage statistics and metrics
 - **Real-time Charts** - Interactive data visualization
 - **Historical Data** - Track usage over 24h and 7d periods
 
-### 🗄️ Database & Performance
+### Database & Performance
 - **PostgreSQL** - Persistent storage with async support
 - **Connection Pooling** - High-performance database queries
 - **ACID Compliance** - Data integrity and consistency
 - **Scalable Design** - Handle millions of requests
 
-### 🎨 User Interface
+### User Interface
 - **Modern React UI** - Clean, responsive design with Tailwind CSS
 - **Dark Mode** - Full dark/light theme support
 - **Mobile Responsive** - Works seamlessly on all devices
 - **Interactive Playground** - Test AI models with custom parameters
 - **Real-time Updates** - Live statistics and analytics
 
-### 📝 API Documentation
+### API Documentation
 - **Swagger UI** - Interactive API documentation at `/docs`
 - **ReDoc** - Alternative API documentation view
 - **Auto-Generated Specs** - OpenAPI 3.0 specification
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
-ollama-api-gateway/
+edgellm-api-gateway/
 ├── backend/                      # FastAPI backend service
 │   ├── main.py                   # API endpoints and business logic
 │   ├── database.py               # SQLAlchemy models and async connections
@@ -97,6 +107,14 @@ ollama-api-gateway/
 │   ├── Dockerfile
 │   └── README.md
 │
+├── mojo-gateway/                 # EdgeLLM inference engine
+│   ├── src/
+│   │   ├── bitnet_tmac_lut.mojo  # Main inference with T-MAC LUT
+│   │   └── kernels/              # C FFI SIMD kernels
+│   ├── models/                   # Model files (.tm2.bin)
+│   ├── benchmarks/               # Benchmark suite
+│   └── README.md                 # Inference engine docs
+│
 ├── docker-compose.yml            # Multi-container orchestration
 ├── .env                          # Environment variables (gitignored)
 ├── .env.example                  # Environment template
@@ -106,12 +124,12 @@ ollama-api-gateway/
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
 - **Docker & Docker Compose** - For containerized deployment
-- **Ollama** - Running locally at http://localhost:11434
+- **EdgeLLM Inference** - Running locally at http://localhost:8080
 - **Git** - To clone the repository
 - **Port 3000, 8000, 5432** - Must be available
 
@@ -119,8 +137,8 @@ ollama-api-gateway/
 
 #### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/ollama-api-gateway.git
-cd ollama-api-gateway
+git clone https://github.com/yourusername/edgellm-api-gateway.git
+cd edgellm-api-gateway
 ```
 
 #### 2. Configure Environment
@@ -180,7 +198,7 @@ npm run dev
 
 ---
 
-## ⚙️ Environment Configuration
+## Environment Configuration
 
 ### Overview
 Environment variables are configured through the `.env` file. This file controls all aspects of the application including database connections, API settings, and feature toggles.
@@ -204,7 +222,7 @@ The minimum required configuration:
 
 ```env
 # Database
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/ollama_api
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/edgellm_api
 
 # API Keys (for demo - generate new ones for production)
 DEMO_ADMIN_KEY=demo-admin-key-12345
@@ -225,16 +243,16 @@ export $(cat .env | xargs)
 
 ---
 
-## 📋 Complete Environment Variables
+## Complete Environment Variables
 
 ### Database Configuration
 
 ```env
 # PostgreSQL Connection
-DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/ollama_api
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/edgellm_api
 
 # Connection Details
-POSTGRES_DB=ollama_api
+POSTGRES_DB=edgellm_api
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_PORT=5432
@@ -278,21 +296,21 @@ PORT=8000
 
 ---
 
-### Ollama Configuration
+### EdgeLLM Configuration
 
 ```env
-# Ollama Service URL
-OLLAMA_BASE_URL=http://host.docker.internal:11434
+# EdgeLLM Service URL
+EDGELLM_BASE_URL=http://host.docker.internal:8080
 ```
 
 **For Different Environments**:
 
 | Environment | URL | Notes |
 |---|---|---|
-| **Docker (macOS/Windows)** | `http://host.docker.internal:11434` | Special Docker DNS |
-| **Docker (Linux)** | `http://172.17.0.1:11434` | Host gateway IP |
-| **Local Development** | `http://localhost:11434` | Direct localhost |
-| **Remote Server** | `http://your-host:11434` | Use actual IP/domain |
+| **Docker (macOS/Windows)** | `http://host.docker.internal:8080` | Special Docker DNS |
+| **Docker (Linux)** | `http://172.17.0.1:8080` | Host gateway IP |
+| **Local Development** | `http://localhost:8080` | Direct localhost |
+| **Remote Server** | `http://your-host:8080` | Use actual IP/domain |
 
 ---
 
@@ -306,7 +324,7 @@ DEMO_ADMIN_KEY=demo-admin-key-12345
 DEMO_USER_KEY=demo-user-key-67890
 ```
 
-**⚠️ Security Warning**:
+**Security Warning**:
 - Change these keys in production
 - Leave empty to disable demo keys: `DEMO_ADMIN_KEY=`
 - Generate secure keys: `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`
@@ -352,7 +370,7 @@ DOCKER_PLATFORM=linux/amd64
 
 ---
 
-## 🔐 First-Time Setup (Step by Step)
+## First-Time Setup (Step by Step)
 
 ### Step 1: Create Admin Account
 ```bash
@@ -360,7 +378,7 @@ DOCKER_PLATFORM=linux/amd64
 curl -X POST http://localhost:8000/api/generate \
   -H "Authorization: Bearer demo-admin-key-12345" \
   -H "Content-Type: application/json" \
-  -d '{"model":"llama2","prompt":"hello"}'
+  -d '{"model":"smollm-135m","prompt":"hello"}'
 
 # Option B: Create new admin key via API
 curl -X POST http://localhost:8000/api/keys \
@@ -390,14 +408,14 @@ curl -X POST http://localhost:8000/api/keys \
 
 ### Step 4: Test with Playground
 1. Go to Playground tab
-2. Select a model (e.g., "llama2")
+2. Select a model (e.g., "smollm-135m")
 3. Enter a prompt
 4. Click "Generate"
 5. View response and usage stats
 
 ---
 
-## 🔑 API Key Management
+## API Key Management
 
 ### Creating API Keys
 
@@ -432,7 +450,7 @@ curl http://localhost:8000/api/keys \
 
 ---
 
-## 📊 Admin Dashboard Features
+## Admin Dashboard Features
 
 ### Overview Tab
 - **Total Users**: Count of active API keys
@@ -459,7 +477,7 @@ curl http://localhost:8000/api/keys \
 
 ---
 
-## 🐳 Docker Commands Reference
+## Docker Commands Reference
 
 ```bash
 # Start all services
@@ -481,7 +499,7 @@ docker compose up -d --build
 docker compose up -d --build backend
 
 # Execute command in container
-docker compose exec ollama-api-service python -c "import secrets; print(secrets.token_urlsafe(32))"
+docker compose exec edgellm-api-service python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # Remove volumes (WARNING: deletes database)
 docker compose down -v
@@ -489,7 +507,7 @@ docker compose down -v
 
 ---
 
-## 🔍 Troubleshooting
+## Troubleshooting
 
 ### Port Already in Use
 ```bash
@@ -512,12 +530,12 @@ docker compose down -v
 docker compose up -d
 ```
 
-### Ollama Not Found
+### EdgeLLM Not Found
 ```bash
-# Check Ollama is running
-curl http://localhost:11434/api/tags
+# Check EdgeLLM is running
+curl http://localhost:8080/health
 
-# Update OLLAMA_BASE_URL in .env
+# Update EDGELLM_BASE_URL in .env
 # Restart containers
 docker compose restart
 ```
@@ -535,16 +553,17 @@ docker compose restart frontend
 
 ---
 
-## 📚 Documentation Files
+## Documentation Files
 
 - **[ENV_CONFIGURATION.md](./ENV_CONFIGURATION.md)** - Detailed environment variables guide
 - **[backend/README.md](./backend/README.md)** - Backend API documentation
 - **[frontend/README.md](./frontend/README.md)** - Frontend setup guide
+- **[mojo-gateway/README.md](./mojo-gateway/README.md)** - EdgeLLM inference engine docs
 - **[API Documentation](http://localhost:8000/docs)** - Interactive Swagger UI
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please follow these steps:
 
@@ -556,22 +575,22 @@ Contributions are welcome! Please follow these steps:
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 ---
 
-## 🙋 Support
+## Support
 
 For issues and questions:
-- GitHub Issues: [Report a bug](https://github.com/yourusername/ollama-api-gateway/issues)
-- Discussions: [Ask a question](https://github.com/yourusername/ollama-api-gateway/discussions)
+- GitHub Issues: [Report a bug](https://github.com/yourusername/edgellm-api-gateway/issues)
+- Discussions: [Ask a question](https://github.com/yourusername/edgellm-api-gateway/discussions)
 - Documentation: [Read the docs](./ENV_CONFIGURATION.md)
 
 ---
 
-## 🎯 Roadmap
+## Roadmap
 
 - [ ] Multi-model support with load balancing
 - [ ] Advanced analytics and reporting
@@ -582,4 +601,4 @@ For issues and questions:
 
 ---
 
-**Made with ❤️ for the Ollama community**
+**Made with love for the EdgeLLM community**

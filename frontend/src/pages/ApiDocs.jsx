@@ -78,7 +78,7 @@ console.log(data);`
             </h1>
           </div>
           <p className="text-lg text-gray-600 dark:text-gray-300">
-            Complete reference for integrating with the Ollama API Gateway
+            Complete reference for integrating with the EdgeLLM API Gateway
           </p>
         </div>
 
@@ -112,7 +112,7 @@ console.log(data);`
                 <code className="text-lg font-mono text-gray-900 dark:text-white">/api/chat</code>
               </div>
               <p className="text-gray-600 dark:text-gray-300 mb-3">
-                Generate AI chat completions using Ollama models
+                Generate AI chat completions using EdgeLLM with deterministic latency
               </p>
               <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
                 <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Request Body:</p>
@@ -142,7 +142,7 @@ console.log(data);`
                 <code className="text-lg font-mono text-gray-900 dark:text-white">/api/models</code>
               </div>
               <p className="text-gray-600 dark:text-gray-300 mb-3">
-                Get list of available Ollama models
+                Get list of available EdgeLLM models
               </p>
               <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
                 <p className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Response:</p>
