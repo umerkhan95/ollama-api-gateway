@@ -139,6 +139,94 @@ int cuda_device_info(
     int* compute_minor
 );
 
+// ============================================================================
+// Phase 1: Persistent GPU Memory API
+// ============================================================================
+
+/**
+ * Load model weights to GPU memory (one-time operation).
+ *
+ * Weights remain on GPU until cuda_unload_weights() or cuda_cleanup().
+ * Subsequent calls to tmac_matmul_cuda_persistent() skip weight transfer.
+ *
+ * @param weights         Packed ternary weights (host memory)
+ * @param scales          Per-row scaling factors (host memory)
+ * @param weight_bytes    Size of weights in bytes
+ * @param num_rows        Number of rows (for scales)
+ * @return 0 on success, -1 on failure
+ */
+int cuda_load_weights(
+    const int8_t* weights,
+    const float* scales,
+    int weight_bytes,
+    int num_rows
+);
+
+/**
+ * Unload weights from GPU memory.
+ *
+ * Call this to free GPU memory when switching models.
+ */
+void cuda_unload_weights(void);
+
+/**
+ * Check if weights are loaded on GPU.
+ *
+ * @return 1 if weights are loaded, 0 otherwise
+ */
+int cuda_weights_loaded(void);
+
+/**
+ * T-MAC Matrix Multiplication with persistent weights (CUDA)
+ *
+ * Uses pre-loaded weights from cuda_load_weights().
+ * Only transfers activations and output - much faster than tmac_matmul_cuda().
+ *
+ * @param activations Input activations (host memory) [K * N]
+ * @param output      Output buffer (host memory) [M * N]
+ * @param M           Number of output rows
+ * @param N           Number of output columns (batch size)
+ * @param K           Inner dimension
+ * @return 0 on success, -1 on failure
+ */
+int tmac_matmul_cuda_persistent(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+);
+
+/**
+ * RMSNorm with persistent weights (CUDA)
+ *
+ * Loads normalization weights to GPU once, reuses across calls.
+ *
+ * @param norm_weights    Normalization weights (host, only used on first call)
+ * @param size            Weight vector size
+ * @return 0 on success, -1 on failure
+ */
+int cuda_load_norm_weights(
+    const float* norm_weights,
+    int size
+);
+
+/**
+ * RMSNorm using pre-loaded weights (CUDA)
+ *
+ * @param output      Output buffer (host memory)
+ * @param input       Input buffer (host memory)
+ * @param batch_size  Number of batches
+ * @param size        Vector size per batch
+ * @param eps         Epsilon for numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int rmsnorm_cuda_persistent(
+    float* output,
+    const float* input,
+    int batch_size,
+    int size,
+    float eps
+);
+
 #ifdef __cplusplus
 }
 #endif

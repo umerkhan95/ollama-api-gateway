@@ -20,12 +20,21 @@
 - Docker-based Mojo development environment
 - Automated benchmark suite with JSON output
 - Unified kernel selector (auto-detects CUDA/AVX2/NEON)
+- **Playwright MCP integration for browser automation**
+- **Google Colab GPU testing pipeline (T4)**
 
 ### In Progress
+- **CUDA kernel optimization to outperform Ollama** (see SKILL.md)
 - Fly.io deployment for cloud benchmarking
 - Paper-ready benchmark evaluation
 - Multi-platform validation
 - Metal kernels for Apple Silicon
+
+### Experimentation Status (Jan 11, 2026)
+
+**Problem Identified**: Current CUDA implementation is 12x slower than Ollama on T4 GPU.
+
+See `SKILL.md` for the detailed optimization roadmap.
 
 ## Key Technologies
 

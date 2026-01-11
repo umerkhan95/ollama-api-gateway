@@ -539,4 +539,191 @@ int cuda_device_info(
     return 0;
 }
 
+// ============================================================================
+// Phase 1: Persistent GPU Memory Implementation
+// ============================================================================
+
+// Persistent weight storage
+static int8_t* d_persistent_weights = nullptr;
+static float* d_persistent_scales = nullptr;
+static float* d_persistent_norm_weights = nullptr;
+static int persistent_weight_bytes = 0;
+static int persistent_num_rows = 0;
+static int persistent_norm_size = 0;
+static int weights_on_gpu = 0;
+static int norm_weights_on_gpu = 0;
+
+/**
+ * Load model weights to GPU memory (one-time operation)
+ */
+int cuda_load_weights(
+    const int8_t* weights,
+    const float* scales,
+    int weight_bytes,
+    int num_rows
+) {
+    if (!cuda_initialized) {
+        fprintf(stderr, "CUDA not initialized. Call cuda_init() first.\n");
+        return -1;
+    }
+
+    // Free existing weights if any
+    if (d_persistent_weights) {
+        cudaFree(d_persistent_weights);
+        d_persistent_weights = nullptr;
+    }
+    if (d_persistent_scales) {
+        cudaFree(d_persistent_scales);
+        d_persistent_scales = nullptr;
+    }
+
+    // Allocate GPU memory for weights
+    CUDA_CHECK(cudaMalloc(&d_persistent_weights, weight_bytes));
+    CUDA_CHECK(cudaMalloc(&d_persistent_scales, num_rows * sizeof(float)));
+
+    // Copy weights to GPU (one-time transfer)
+    CUDA_CHECK(cudaMemcpy(d_persistent_weights, weights, weight_bytes, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_persistent_scales, scales, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+
+    persistent_weight_bytes = weight_bytes;
+    persistent_num_rows = num_rows;
+    weights_on_gpu = 1;
+
+    printf("EdgeLLM: Loaded %d bytes of weights to GPU (%d rows)\n", weight_bytes, num_rows);
+
+    return 0;
+}
+
+/**
+ * Unload weights from GPU memory
+ */
+void cuda_unload_weights() {
+    if (d_persistent_weights) {
+        cudaFree(d_persistent_weights);
+        d_persistent_weights = nullptr;
+    }
+    if (d_persistent_scales) {
+        cudaFree(d_persistent_scales);
+        d_persistent_scales = nullptr;
+    }
+    persistent_weight_bytes = 0;
+    persistent_num_rows = 0;
+    weights_on_gpu = 0;
+}
+
+/**
+ * Check if weights are loaded on GPU
+ */
+int cuda_weights_loaded() {
+    return weights_on_gpu;
+}
+
+/**
+ * T-MAC Matrix Multiplication with persistent weights
+ *
+ * This is the FAST version - only transfers activations, not weights.
+ * Weights must be pre-loaded via cuda_load_weights().
+ */
+int tmac_matmul_cuda_persistent(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+) {
+    if (!cuda_initialized) {
+        fprintf(stderr, "CUDA not initialized. Call cuda_init() first.\n");
+        return -1;
+    }
+
+    if (!weights_on_gpu) {
+        fprintf(stderr, "Weights not loaded. Call cuda_load_weights() first.\n");
+        return -1;
+    }
+
+    // Calculate sizes
+    int act_size = K * N;
+    int out_size = M * N;
+
+    // Transfer ONLY activations to device (weights already there!)
+    CUDA_CHECK(cudaMemcpy(d_activations, activations, act_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch kernel using persistent weights
+    dim3 grid(M, (N + TILE_N - 1) / TILE_N);
+    dim3 block(BLOCK_SIZE);
+
+    tmac_matmul_kernel<<<grid, block>>>(
+        d_persistent_weights,
+        d_activations,
+        d_output,
+        d_persistent_scales,
+        M, N, K
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Transfer output back to host
+    CUDA_CHECK(cudaMemcpy(output, d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
+/**
+ * Load normalization weights to GPU
+ */
+int cuda_load_norm_weights(
+    const float* norm_weights,
+    int size
+) {
+    if (!cuda_initialized) {
+        fprintf(stderr, "CUDA not initialized. Call cuda_init() first.\n");
+        return -1;
+    }
+
+    // Free existing norm weights if any
+    if (d_persistent_norm_weights) {
+        cudaFree(d_persistent_norm_weights);
+        d_persistent_norm_weights = nullptr;
+    }
+
+    // Allocate and copy
+    CUDA_CHECK(cudaMalloc(&d_persistent_norm_weights, size * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(d_persistent_norm_weights, norm_weights, size * sizeof(float), cudaMemcpyHostToDevice));
+
+    persistent_norm_size = size;
+    norm_weights_on_gpu = 1;
+
+    return 0;
+}
+
+/**
+ * RMSNorm using pre-loaded weights
+ */
+int rmsnorm_cuda_persistent(
+    float* output,
+    const float* input,
+    int batch_size,
+    int size,
+    float eps
+) {
+    if (!cuda_initialized) return -1;
+    if (!norm_weights_on_gpu) {
+        fprintf(stderr, "Norm weights not loaded. Call cuda_load_norm_weights() first.\n");
+        return -1;
+    }
+
+    // Copy only input to device (weights already there!)
+    CUDA_CHECK(cudaMemcpy(d_activations, input, batch_size * size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch kernel with persistent norm weights
+    rmsnorm_kernel<<<batch_size, BLOCK_SIZE>>>(
+        d_output, d_activations, d_persistent_norm_weights, size, eps
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Copy output back
+    CUDA_CHECK(cudaMemcpy(output, d_output, batch_size * size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
 } // extern "C"
