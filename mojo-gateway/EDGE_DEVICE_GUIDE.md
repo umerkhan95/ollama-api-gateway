@@ -4,7 +4,104 @@
 
 ---
 
-## Why EdgeLLM Will Transform Edge AI
+## EdgeLLM Explained Simply (No Tech Jargon)
+
+### Think of AI Models Like Cars
+
+**Ollama** is like a **sports car**:
+- Super fast on the highway (136 tok/s)
+- But sometimes it randomly stops for gas (garbage collection)
+- Needs a big garage ($800+ computer)
+- Uses lots of fuel (91MB model, 8GB+ RAM)
+
+**EdgeLLM** is like a **reliable scooter**:
+- Slower on the highway (8 tok/s currently)
+- But NEVER randomly stops - completely predictable
+- Fits in a tiny shed ($15 Raspberry Pi)
+- Sips fuel (40MB model, 256MB RAM)
+
+---
+
+### The 3 Big Advantages
+
+#### 1. We're PREDICTABLE (Low Jitter)
+
+Imagine you're asking a question:
+
+```
+Ollama Response Time:
+  Ask #1: 0.2 seconds  ✓ Fast!
+  Ask #2: 8.8 seconds  😐 Okay...
+  Ask #3: 19.7 seconds 😤 Why so slow?!
+
+EdgeLLM Response Time:
+  Ask #1: 4.6 seconds  ✓
+  Ask #2: 4.7 seconds  ✓
+  Ask #3: 4.6 seconds  ✓ Always the same!
+```
+
+**Why this matters:**
+- A robot arm needs to know EXACTLY when a response comes
+- A voice assistant can't randomly take 20 seconds
+- Factory machines need consistent timing
+
+**Analogy:** Would you rather have a bus that arrives "sometime between 1 and 20 minutes" or one that ALWAYS arrives in 5 minutes?
+
+---
+
+#### 2. We're TINY (6.5x Smaller)
+
+```
+Same AI brain, different sizes:
+
+Original Model:     [████████████████████████████] 256 MB
+Ollama Version:     [███████████]                   91 MB
+EdgeLLM Version:    [████]                          40 MB
+```
+
+**How?** We use a clever trick called **BitNet**:
+- Normal AI: Each "thought" stored as a complex number
+- Our AI: Each "thought" is just -1, 0, or +1 (three options)
+
+**Analogy:** Instead of writing "2.7834729", we just write "+" or "-" or "0". Way less space, still works!
+
+---
+
+#### 3. We're CHEAP (53x Less Hardware)
+
+| To Run Ollama | To Run EdgeLLM |
+|---------------|----------------|
+| Gaming PC: $800+ | Raspberry Pi Zero: $15 |
+| 8GB RAM minimum | 256MB RAM enough |
+| Big power supply | USB phone charger |
+
+---
+
+### Real World Examples
+
+**Smart Doorbell:**
+- Ollama: Needs a computer inside your wall 💸
+- EdgeLLM: Runs on a $15 chip in the doorbell ✓
+
+**Farm Sensor:**
+- Ollama: Needs internet to work 🌐
+- EdgeLLM: Works offline in the middle of nowhere ✓
+
+**Robot Arm in Factory:**
+- Ollama: Response in 0.2 to 20 seconds (unpredictable) ⚠️
+- EdgeLLM: Response in 4.5 seconds (always) ✓
+
+---
+
+### One Line Summary
+
+> **EdgeLLM trades raw speed for PREDICTABILITY and the ability to run on devices the size of a credit card.**
+
+It's not about being the fastest car. It's about being the only car that fits in your pocket and never breaks down.
+
+---
+
+## Why EdgeLLM Will Transform Edge AI (Technical Details)
 
 ### The Problem with Current Solutions
 
