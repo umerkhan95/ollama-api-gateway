@@ -1410,4 +1410,630 @@ int fused_rmsnorm_matmul_cuda_adaptive(
     }
 }
 
+// ============================================================================
+// Phase 3: INT8 Tensor Core Implementation
+// ============================================================================
+
+// Check for Tensor Core support (compile-time)
+#if __CUDA_ARCH__ >= 750
+#include <mma.h>
+using namespace nvcuda::wmma;
+#define HAS_WMMA 1
+#else
+#define HAS_WMMA 0
+#endif
+
+// WMMA tile dimensions for INT8
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+
+// Block configuration for Tensor Core kernel
+#define TC_BLOCK_M 64   // Output rows per block (4 WMMA tiles)
+#define TC_BLOCK_N 64   // Output cols per block (4 WMMA tiles)
+#define TC_WARPS_M 4    // Warps in M dimension
+#define TC_WARPS_N 2    // Warps in N dimension
+
+// Thresholds for INT8 TC dispatch
+#define TC_MIN_ELEMENTS 50000   // M*K threshold for TC benefit
+#define TC_MIN_COMPUTE_CAP 75   // Minimum compute capability
+
+// Persistent INT8 TC buffers
+static int8_t* d_weights_int8_expanded = nullptr;  // [M * K] expanded weights
+static float* d_weights_int8_scales = nullptr;     // [M] weight scales
+static int8_t* d_activations_int8 = nullptr;       // [max_K * max_N] quantized activations
+static float* d_act_scales = nullptr;              // [max_N] activation scales
+static int32_t* d_output_int32 = nullptr;          // [max_M * max_N] INT32 accumulator
+static int weights_int8_tc_loaded = 0;
+static int persistent_K_int8 = 0;
+static int persistent_M_int8 = 0;
+static int cached_compute_capability = -1;
+
+/**
+ * Kernel: Expand 2-bit packed ternary weights to INT8
+ *
+ * Each byte contains 4 ternary values (2 bits each).
+ * This kernel expands them to full INT8 format for Tensor Cores.
+ */
+__global__ void expand_ternary_to_int8_kernel(
+    const int8_t* __restrict__ packed_weights,  // [M * K/4] packed
+    int8_t* __restrict__ expanded_weights,      // [M * K] expanded
+    int M, int K
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = M * K;
+
+    if (idx < total_elements) {
+        int row = idx / K;
+        int k = idx % K;
+
+        int weight_row_bytes = (K + 3) / 4;
+        int byte_idx = k / 4;
+        int bit_offset = (k % 4) * 2;
+
+        int8_t packed = packed_weights[row * weight_row_bytes + byte_idx];
+        int ternary = ((packed >> bit_offset) & 0x3) - 1;  // -1, 0, +1
+
+        expanded_weights[row * K + k] = (int8_t)ternary;
+    }
+}
+
+/**
+ * Kernel: Quantize FP32 activations to INT8 with per-token scaling
+ *
+ * Uses absmax symmetric quantization:
+ * scale = absmax / 127
+ * quantized = round(value / scale)
+ */
+__global__ void quantize_activations_int8_kernel(
+    const float* __restrict__ input_fp32,   // [K * N] or [K] for batch=1
+    int8_t* __restrict__ output_int8,       // [K * N]
+    float* __restrict__ scales,             // [N] per-token scale
+    int K, int N
+) {
+    __shared__ float smem_max[BLOCK_SIZE];
+
+    int col = blockIdx.x;  // Token/batch index
+    int tid = threadIdx.x;
+
+    if (col >= N) return;
+
+    // Step 1: Find absmax of this token's activations
+    float local_max = 0.0f;
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+        float val = fabsf(input_fp32[k * N + col]);
+        local_max = fmaxf(local_max, val);
+    }
+
+    // Reduce to find global max
+    smem_max[tid] = local_max;
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem_max[tid] = fmaxf(smem_max[tid], smem_max[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    float absmax = smem_max[0];
+    float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+
+    if (tid == 0) {
+        scales[col] = scale;
+    }
+    __syncthreads();
+
+    // Step 2: Quantize activations
+    float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 1.0f;
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+        float val = input_fp32[k * N + col];
+        int quantized = __float2int_rn(val * inv_scale);
+        // Clamp to INT8 range
+        quantized = max(-127, min(127, quantized));
+        output_int8[k * N + col] = (int8_t)quantized;
+    }
+}
+
+/**
+ * Kernel: Dequantize INT32 accumulator to FP32 output
+ *
+ * output_fp32 = output_int32 * weight_scale * act_scale
+ */
+__global__ void dequantize_output_kernel(
+    const int32_t* __restrict__ output_int32,  // [M * N]
+    float* __restrict__ output_fp32,           // [M * N]
+    const float* __restrict__ weight_scales,   // [M]
+    const float* __restrict__ act_scales,      // [N]
+    int M, int N
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < M * N) {
+        int row = idx / N;
+        int col = idx % N;
+
+        float scale = weight_scales[row] * act_scales[col];
+        output_fp32[idx] = (float)output_int32[idx] * scale;
+    }
+}
+
+#if HAS_WMMA
+/**
+ * INT8 Tensor Core Matrix Multiplication Kernel
+ *
+ * Uses WMMA API for INT8 GEMM with 16x16x16 tiles.
+ * Each block computes a TC_BLOCK_M x TC_BLOCK_N output tile.
+ *
+ * Note: Requires compute capability >= 7.5 (Turing/Ampere)
+ */
+__global__ void int8_tensorcore_matmul_kernel(
+    const int8_t* __restrict__ weights_int8,     // [M, K] row-major
+    const int8_t* __restrict__ activations_int8, // [K, N] row-major
+    int32_t* __restrict__ output_int32,          // [M, N] row-major
+    int M, int N, int K
+) {
+    // Shared memory for tiles
+    __shared__ int8_t smem_A[TC_BLOCK_M][WMMA_K + 4];  // +4 for bank conflict avoidance
+    __shared__ int8_t smem_B[WMMA_K][TC_BLOCK_N + 4];
+
+    // Block position
+    int block_row = blockIdx.x * TC_BLOCK_M;
+    int block_col = blockIdx.y * TC_BLOCK_N;
+
+    // Warp position within block
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_row = (warp_id / TC_WARPS_N) * WMMA_M;
+    int warp_col = (warp_id % TC_WARPS_N) * WMMA_N;
+
+    // Declare WMMA fragments
+    fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, signed char, row_major> frag_A[TC_WARPS_M];
+    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, signed char, col_major> frag_B[TC_WARPS_N];
+    fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, int> frag_C;
+
+    // Initialize accumulator
+    fill_fragment(frag_C, 0);
+
+    // Iterate over K dimension in WMMA_K tiles
+    for (int k_base = 0; k_base < K; k_base += WMMA_K) {
+        // Collaborative load A tile (weights) into shared memory
+        int num_loads_A = (TC_BLOCK_M * WMMA_K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        for (int i = 0; i < num_loads_A; i++) {
+            int load_idx = threadIdx.x + i * BLOCK_SIZE;
+            if (load_idx < TC_BLOCK_M * WMMA_K) {
+                int m_off = load_idx / WMMA_K;
+                int k_off = load_idx % WMMA_K;
+                int m_global = block_row + m_off;
+                int k_global = k_base + k_off;
+
+                if (m_global < M && k_global < K) {
+                    smem_A[m_off][k_off] = weights_int8[m_global * K + k_global];
+                } else {
+                    smem_A[m_off][k_off] = 0;
+                }
+            }
+        }
+
+        // Collaborative load B tile (activations) into shared memory
+        int num_loads_B = (WMMA_K * TC_BLOCK_N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        for (int i = 0; i < num_loads_B; i++) {
+            int load_idx = threadIdx.x + i * BLOCK_SIZE;
+            if (load_idx < WMMA_K * TC_BLOCK_N) {
+                int k_off = load_idx / TC_BLOCK_N;
+                int n_off = load_idx % TC_BLOCK_N;
+                int k_global = k_base + k_off;
+                int n_global = block_col + n_off;
+
+                if (k_global < K && n_global < N) {
+                    smem_B[k_off][n_off] = activations_int8[k_global * N + n_global];
+                } else {
+                    smem_B[k_off][n_off] = 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Load WMMA fragments from shared memory and compute
+        if (block_row + warp_row < M && block_col + warp_col < N) {
+            load_matrix_sync(frag_A[0], &smem_A[warp_row][0], WMMA_K + 4);
+            load_matrix_sync(frag_B[0], &smem_B[0][warp_col], TC_BLOCK_N + 4);
+
+            // Tensor Core MMA operation
+            mma_sync(frag_C, frag_A[0], frag_B[0], frag_C);
+        }
+        __syncthreads();
+    }
+
+    // Store result
+    int out_row = block_row + warp_row;
+    int out_col = block_col + warp_col;
+
+    if (out_row < M && out_col < N) {
+        store_matrix_sync(&output_int32[out_row * N + out_col], frag_C, N, mem_row_major);
+    }
+}
+#endif // HAS_WMMA
+
+/**
+ * Fallback INT8 matmul kernel for devices without WMMA support
+ * Uses standard CUDA cores with INT8 accumulation
+ */
+__global__ void int8_fallback_matmul_kernel(
+    const int8_t* __restrict__ weights_int8,
+    const int8_t* __restrict__ activations_int8,
+    int32_t* __restrict__ output_int32,
+    int M, int N, int K
+) {
+    int row = blockIdx.x;
+    int col = blockIdx.y;
+    int tid = threadIdx.x;
+
+    if (row >= M || col >= N) return;
+
+    // Each thread accumulates partial sum
+    int partial_sum = 0;
+
+    for (int k = tid; k < K; k += BLOCK_SIZE) {
+        int8_t w = weights_int8[row * K + k];
+        int8_t a = activations_int8[k * N + col];
+        partial_sum += (int)w * (int)a;
+    }
+
+    // Warp-level reduction
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+    }
+
+    // Write warp results to shared memory
+    __shared__ int warp_sums[8];
+    int lane = tid % WARP_SIZE;
+    int warp_id = tid / WARP_SIZE;
+
+    if (lane == 0) {
+        warp_sums[warp_id] = partial_sum;
+    }
+    __syncthreads();
+
+    // Final reduction
+    if (warp_id == 0 && tid < (BLOCK_SIZE / WARP_SIZE)) {
+        partial_sum = warp_sums[tid];
+
+        #pragma unroll
+        for (int offset = (BLOCK_SIZE / WARP_SIZE) / 2; offset > 0; offset /= 2) {
+            partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+        }
+
+        if (tid == 0) {
+            output_int32[row * N + col] = partial_sum;
+        }
+    }
+}
+
+/**
+ * Get compute capability of current device
+ */
+int cuda_get_compute_capability() {
+    if (cached_compute_capability >= 0) {
+        return cached_compute_capability;
+    }
+
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, 0);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+
+    cached_compute_capability = prop.major * 10 + prop.minor;
+    return cached_compute_capability;
+}
+
+/**
+ * Check if INT8 Tensor Cores are available
+ */
+int cuda_has_int8_tensorcore() {
+    int cc = cuda_get_compute_capability();
+    return (cc >= TC_MIN_COMPUTE_CAP) ? 1 : 0;
+}
+
+/**
+ * Get device count
+ */
+int cuda_get_device_count() {
+    int count = 0;
+    cudaGetDeviceCount(&count);
+    return count;
+}
+
+/**
+ * Load weights in INT8 Tensor Core format
+ */
+int cuda_load_weights_int8_tc(
+    const int8_t* packed_weights,
+    const float* scales,
+    int weight_bytes,
+    int num_rows,
+    int K
+) {
+    if (!cuda_initialized) {
+        fprintf(stderr, "CUDA not initialized. Call cuda_init() first.\n");
+        return -1;
+    }
+
+    // Free existing INT8 TC weights
+    if (d_weights_int8_expanded) {
+        cudaFree(d_weights_int8_expanded);
+        d_weights_int8_expanded = nullptr;
+    }
+    if (d_weights_int8_scales) {
+        cudaFree(d_weights_int8_scales);
+        d_weights_int8_scales = nullptr;
+    }
+
+    int expanded_size = num_rows * K;
+
+    // Allocate expanded weights buffer
+    CUDA_CHECK(cudaMalloc(&d_weights_int8_expanded, expanded_size * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_weights_int8_scales, num_rows * sizeof(float)));
+
+    // Copy packed weights to temporary buffer
+    int8_t* d_packed_temp;
+    CUDA_CHECK(cudaMalloc(&d_packed_temp, weight_bytes));
+    CUDA_CHECK(cudaMemcpy(d_packed_temp, packed_weights, weight_bytes, cudaMemcpyHostToDevice));
+
+    // Launch expansion kernel
+    int threads = 256;
+    int blocks = (expanded_size + threads - 1) / threads;
+    expand_ternary_to_int8_kernel<<<blocks, threads>>>(
+        d_packed_temp,
+        d_weights_int8_expanded,
+        num_rows, K
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Free temporary packed weights
+    cudaFree(d_packed_temp);
+
+    // Copy scales
+    CUDA_CHECK(cudaMemcpy(d_weights_int8_scales, scales, num_rows * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Allocate working buffers for activations and output
+    int max_K = K;
+    int max_N = 64;  // Support up to batch=64
+    int max_M = num_rows;
+
+    if (d_activations_int8) cudaFree(d_activations_int8);
+    if (d_act_scales) cudaFree(d_act_scales);
+    if (d_output_int32) cudaFree(d_output_int32);
+
+    CUDA_CHECK(cudaMalloc(&d_activations_int8, max_K * max_N * sizeof(int8_t)));
+    CUDA_CHECK(cudaMalloc(&d_act_scales, max_N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output_int32, max_M * max_N * sizeof(int32_t)));
+
+    persistent_K_int8 = K;
+    persistent_M_int8 = num_rows;
+    weights_int8_tc_loaded = 1;
+
+    printf("EdgeLLM: Loaded INT8 TC weights (%d rows x %d cols = %.2f MB expanded)\n",
+           num_rows, K, expanded_size / (1024.0f * 1024.0f));
+
+    return 0;
+}
+
+/**
+ * Unload INT8 TC weights
+ */
+void cuda_unload_weights_int8_tc() {
+    if (d_weights_int8_expanded) {
+        cudaFree(d_weights_int8_expanded);
+        d_weights_int8_expanded = nullptr;
+    }
+    if (d_weights_int8_scales) {
+        cudaFree(d_weights_int8_scales);
+        d_weights_int8_scales = nullptr;
+    }
+    if (d_activations_int8) {
+        cudaFree(d_activations_int8);
+        d_activations_int8 = nullptr;
+    }
+    if (d_act_scales) {
+        cudaFree(d_act_scales);
+        d_act_scales = nullptr;
+    }
+    if (d_output_int32) {
+        cudaFree(d_output_int32);
+        d_output_int32 = nullptr;
+    }
+    weights_int8_tc_loaded = 0;
+    persistent_K_int8 = 0;
+    persistent_M_int8 = 0;
+}
+
+/**
+ * Check if INT8 TC weights are loaded
+ */
+int cuda_weights_int8_tc_loaded() {
+    return weights_int8_tc_loaded;
+}
+
+/**
+ * INT8 Tensor Core Matrix Multiplication
+ */
+int tmac_matmul_cuda_int8_tc(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+) {
+    if (!cuda_initialized) {
+        fprintf(stderr, "CUDA not initialized.\n");
+        return -1;
+    }
+    if (!weights_int8_tc_loaded) {
+        fprintf(stderr, "INT8 TC weights not loaded. Call cuda_load_weights_int8_tc() first.\n");
+        return -1;
+    }
+
+    // Step 1: Copy FP32 activations to device
+    CUDA_CHECK(cudaMemcpy(d_activations, activations, K * N * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Step 2: Quantize activations to INT8
+    quantize_activations_int8_kernel<<<N, BLOCK_SIZE>>>(
+        d_activations,
+        d_activations_int8,
+        d_act_scales,
+        K, N
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 3: INT8 Matrix Multiplication
+    int cc = cuda_get_compute_capability();
+
+#if HAS_WMMA
+    if (cc >= TC_MIN_COMPUTE_CAP) {
+        // Use Tensor Core kernel
+        dim3 grid((M + TC_BLOCK_M - 1) / TC_BLOCK_M, (N + TC_BLOCK_N - 1) / TC_BLOCK_N);
+        dim3 block(BLOCK_SIZE);
+
+        int8_tensorcore_matmul_kernel<<<grid, block>>>(
+            d_weights_int8_expanded,
+            d_activations_int8,
+            d_output_int32,
+            M, N, K
+        );
+    } else
+#endif
+    {
+        // Use fallback kernel
+        dim3 grid(M, N);
+        dim3 block(BLOCK_SIZE);
+
+        int8_fallback_matmul_kernel<<<grid, block>>>(
+            d_weights_int8_expanded,
+            d_activations_int8,
+            d_output_int32,
+            M, N, K
+        );
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 4: Dequantize output to FP32
+    int total_output = M * N;
+    int dequant_blocks = (total_output + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    dequantize_output_kernel<<<dequant_blocks, BLOCK_SIZE>>>(
+        d_output_int32,
+        d_output,
+        d_weights_int8_scales,
+        d_act_scales,
+        M, N
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Step 5: Copy output back to host
+    CUDA_CHECK(cudaMemcpy(output, d_output, M * N * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
+/**
+ * Streaming Fused RMSNorm + INT8 TC MatMul
+ */
+int streaming_fused_rmsnorm_matmul_int8_tc(
+    const float* input,
+    float* output,
+    int M, int K,
+    float eps
+) {
+    if (!cuda_initialized || !weights_int8_tc_loaded || !norm_weights_on_gpu) {
+        return -1;
+    }
+
+    // For now, implement as separate RMSNorm + INT8 TC MatMul
+    // True fusion can be added later as optimization
+
+    // Allocate temporary normalized buffer
+    float* norm_output;
+    CUDA_CHECK(cudaMalloc(&norm_output, K * sizeof(float)));
+
+    // Copy input to device
+    CUDA_CHECK(cudaMemcpy(d_activations, input, K * sizeof(float), cudaMemcpyHostToDevice));
+
+    // RMSNorm
+    rmsnorm_kernel<<<1, BLOCK_SIZE>>>(
+        norm_output, d_activations, d_persistent_norm_weights, K, eps
+    );
+    CUDA_CHECK(cudaGetLastError());
+
+    // Copy normalized output back to do quantization
+    float* h_norm_output = (float*)malloc(K * sizeof(float));
+    CUDA_CHECK(cudaMemcpy(h_norm_output, norm_output, K * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaFree(norm_output);
+
+    // INT8 TC MatMul
+    int ret = tmac_matmul_cuda_int8_tc(h_norm_output, output, M, 1, K);
+
+    free(h_norm_output);
+    return ret;
+}
+
+/**
+ * Adaptive dispatch v2 with INT8 Tensor Core support
+ */
+int fused_rmsnorm_matmul_cuda_adaptive_v2(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+) {
+    if (!cuda_initialized) return -1;
+
+    int cc = cuda_get_compute_capability();
+    long long elements = (long long)M * K;
+    int k_aligned = (K % WMMA_K == 0);
+
+    // Decision logic for kernel selection
+    if (cc >= TC_MIN_COMPUTE_CAP &&
+        weights_int8_tc_loaded &&
+        elements >= TC_MIN_ELEMENTS &&
+        k_aligned) {
+        // Use INT8 Tensor Core path
+        if (N == 1 && norm_weights_on_gpu) {
+            return streaming_fused_rmsnorm_matmul_int8_tc(input, output, M, K, eps);
+        } else {
+            // Separate RMSNorm + INT8 TC MatMul
+            float* norm_out = (float*)malloc(K * N * sizeof(float));
+            if (!norm_out) return -1;
+
+            int ret = rmsnorm_cuda_persistent(norm_out, input, N, K, eps);
+            if (ret != 0) {
+                free(norm_out);
+                return ret;
+            }
+
+            ret = tmac_matmul_cuda_int8_tc(norm_out, output, M, N, K);
+            free(norm_out);
+            return ret;
+        }
+    }
+
+    // Fall back to previous adaptive dispatch
+    return fused_rmsnorm_matmul_cuda_adaptive(input, output, M, N, K, eps);
+}
+
+/**
+ * Multi-GPU initialization (stub for future implementation)
+ */
+int cuda_init_multi_gpu(int num_gpus) {
+    int available = cuda_get_device_count();
+    if (num_gpus > available) {
+        fprintf(stderr, "Requested %d GPUs but only %d available.\n", num_gpus, available);
+        return -1;
+    }
+
+    printf("EdgeLLM: Multi-GPU support initialized with %d devices\n", num_gpus);
+    // TODO: Implement tensor parallelism across GPUs
+    return 0;
+}
+
 } // extern "C"

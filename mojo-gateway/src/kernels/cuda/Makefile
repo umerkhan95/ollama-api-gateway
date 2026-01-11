@@ -99,9 +99,38 @@ debug: all
 profile: NVCC_FLAGS += -lineinfo
 profile: all
 
+# Tensor Core build (INT8 support for sm_75+)
+# Enables WMMA API for INT8 Tensor Core operations
+tensorcore:
+	$(MAKE) CUDA_ARCH="-gencode arch=compute_75,code=sm_75 \
+	                   -gencode arch=compute_80,code=sm_80 \
+	                   -gencode arch=compute_86,code=sm_86 \
+	                   -gencode arch=compute_87,code=sm_87 \
+	                   -gencode arch=compute_89,code=sm_89" \
+	        NVCC_FLAGS_COMMON="$(NVCC_FLAGS_COMMON) --expt-relaxed-constexpr"
+
+# T4 specific build (Kaggle/Colab)
+t4:
+	$(MAKE) CUDA_ARCH="-gencode arch=compute_75,code=sm_75" \
+	        NVCC_FLAGS_COMMON="$(NVCC_FLAGS_COMMON) --expt-relaxed-constexpr"
+
+# A100 specific build
+a100:
+	$(MAKE) CUDA_ARCH="-gencode arch=compute_80,code=sm_80" \
+	        NVCC_FLAGS_COMMON="$(NVCC_FLAGS_COMMON) --expt-relaxed-constexpr"
+
 # Print configuration
 info:
 	@echo "NVCC: $(shell which nvcc 2>/dev/null || echo 'not found')"
 	@nvcc --version 2>/dev/null || echo "CUDA not available"
 	@echo "Target: $(TARGET)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
+	@echo ""
+	@echo "Build targets:"
+	@echo "  make            - Default multi-arch build"
+	@echo "  make tensorcore - INT8 Tensor Core optimized (sm_75+)"
+	@echo "  make t4         - Tesla T4 optimized (Kaggle/Colab)"
+	@echo "  make a100       - A100 optimized"
+	@echo "  make jetson-nano - Jetson Nano (sm_53)"
+	@echo "  make jetson-orin - Jetson Orin (sm_87)"
+	@echo "  make rtx        - RTX 30/40 series"

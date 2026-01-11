@@ -419,6 +419,149 @@ int fused_rmsnorm_matmul_cuda_adaptive(
     float eps
 );
 
+// ============================================================================
+// Phase 3: INT8 Tensor Core API
+// ============================================================================
+
+/**
+ * Check if INT8 Tensor Cores are available.
+ * Requires compute capability >= 7.5 (Turing+)
+ *
+ * @return 1 if INT8 Tensor Cores available, 0 otherwise
+ */
+int cuda_has_int8_tensorcore(void);
+
+/**
+ * Get compute capability of the current CUDA device.
+ *
+ * @return Compute capability as integer (e.g., 75 for sm_75, 86 for sm_86)
+ */
+int cuda_get_compute_capability(void);
+
+/**
+ * Load weights in INT8 Tensor Core format.
+ *
+ * Expands 2-bit packed ternary weights to full INT8 format.
+ * This is a one-time operation at model load time.
+ * Memory usage: 4x the packed weight size.
+ *
+ * @param packed_weights  Packed ternary weights [M * K/4]
+ * @param scales          Per-row scaling factors [M]
+ * @param weight_bytes    Size of packed weights in bytes
+ * @param num_rows        M dimension (number of output rows)
+ * @param K               K dimension (inner dimension)
+ * @return 0 on success, -1 on failure
+ */
+int cuda_load_weights_int8_tc(
+    const int8_t* packed_weights,
+    const float* scales,
+    int weight_bytes,
+    int num_rows,
+    int K
+);
+
+/**
+ * Unload INT8 Tensor Core weights from GPU memory.
+ */
+void cuda_unload_weights_int8_tc(void);
+
+/**
+ * Check if INT8 TC weights are loaded.
+ *
+ * @return 1 if INT8 TC weights loaded, 0 otherwise
+ */
+int cuda_weights_int8_tc_loaded(void);
+
+/**
+ * INT8 Tensor Core Matrix Multiplication.
+ *
+ * Performs: output = weights @ activations
+ * - Automatically quantizes FP32 activations to INT8
+ * - Uses Tensor Core WMMA API for fast INT8 GEMM
+ * - Dequantizes INT32 accumulator to FP32 output
+ *
+ * Requires: cuda_load_weights_int8_tc() called first.
+ *
+ * @param activations  FP32 input activations [K * N]
+ * @param output       FP32 output buffer [M * N]
+ * @param M            Number of output rows
+ * @param N            Batch size (number of output columns)
+ * @param K            Inner dimension
+ * @return 0 on success, -1 on failure
+ */
+int tmac_matmul_cuda_int8_tc(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+);
+
+/**
+ * Streaming Fused RMSNorm + INT8 Tensor Core MatMul.
+ *
+ * Combines normalization with Tensor Core matrix multiplication.
+ * Best for large matrices where Tensor Core overhead is amortized.
+ *
+ * @param input   Input activations [K]
+ * @param output  Output buffer [M]
+ * @param M       Output dimension
+ * @param K       Hidden size / input dimension
+ * @param eps     Epsilon for RMSNorm numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int streaming_fused_rmsnorm_matmul_int8_tc(
+    const float* input,
+    float* output,
+    int M, int K,
+    float eps
+);
+
+/**
+ * Adaptive dispatch v2 with INT8 Tensor Core support.
+ *
+ * Automatically selects the optimal kernel based on:
+ * - Hardware capability (INT8 TC requires sm_75+)
+ * - Tensor dimensions (TC needs K divisible by 16)
+ * - Tensor size (TC overhead only worthwhile for large matrices)
+ *
+ * Kernel selection:
+ * - INT8 Tensor Core: Large aligned matrices on sm_75+
+ * - Streaming Fused: Batch size 1, medium matrices
+ * - V3 Warp-Private: Small matrices, fallback
+ *
+ * @param input   Input activations [K * N]
+ * @param output  Output buffer [M * N]
+ * @param M       Number of output rows
+ * @param N       Batch size
+ * @param K       Hidden size / input dimension
+ * @param eps     Epsilon for RMSNorm numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int fused_rmsnorm_matmul_cuda_adaptive_v2(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+);
+
+// ============================================================================
+// Phase 3.2: Multi-GPU API (Future)
+// ============================================================================
+
+/**
+ * Initialize multi-GPU context.
+ *
+ * @param num_gpus  Number of GPUs to use
+ * @return 0 on success, -1 on failure
+ */
+int cuda_init_multi_gpu(int num_gpus);
+
+/**
+ * Get number of available CUDA devices.
+ *
+ * @return Number of CUDA devices, or 0 if none available
+ */
+int cuda_get_device_count(void);
+
 #ifdef __cplusplus
 }
 #endif
