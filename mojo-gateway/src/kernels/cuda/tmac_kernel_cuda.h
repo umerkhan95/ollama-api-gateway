@@ -227,6 +227,107 @@ int rmsnorm_cuda_persistent(
     float eps
 );
 
+// ============================================================================
+// Phase 2: Kernel Fusion + CUDA Streams API
+// ============================================================================
+
+/**
+ * Initialize CUDA streams for async operations.
+ *
+ * Creates compute and transfer streams for overlapping operations.
+ *
+ * @return 0 on success, -1 on failure
+ */
+int cuda_init_streams(void);
+
+/**
+ * Cleanup CUDA streams.
+ */
+void cuda_cleanup_streams(void);
+
+/**
+ * Allocate pinned (page-locked) host memory for faster transfers.
+ *
+ * @param max_activations   Maximum activation buffer size
+ * @param max_output        Maximum output buffer size
+ * @return 0 on success, -1 on failure
+ */
+int cuda_alloc_pinned(int max_activations, int max_output);
+
+/**
+ * Free pinned host memory.
+ */
+void cuda_free_pinned(void);
+
+/**
+ * Fused RMSNorm + T-MAC MatMul (CUDA)
+ *
+ * Combines normalization and matrix multiplication in one kernel launch.
+ * Requires both norm weights (cuda_load_norm_weights) and matmul weights
+ * (cuda_load_weights) to be pre-loaded.
+ *
+ * @param input     Input activations (host memory) [K * N]
+ * @param output    Output buffer (host memory) [M * N]
+ * @param M         Number of output rows
+ * @param N         Number of output columns (batch size)
+ * @param K         Hidden size / input dimension
+ * @param eps       Epsilon for RMSNorm numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int fused_rmsnorm_matmul_cuda(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+);
+
+/**
+ * Async T-MAC MatMul using CUDA streams (CUDA)
+ *
+ * Overlaps data transfer with computation.
+ * Call cuda_sync_streams() to wait for completion.
+ *
+ * @param activations Input activations (host memory) [K * N]
+ * @param output      Output buffer (host memory) [M * N]
+ * @param M           Number of output rows
+ * @param N           Number of output columns (batch size)
+ * @param K           Inner dimension
+ * @return 0 on success, -1 on failure
+ */
+int tmac_matmul_cuda_async(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+);
+
+/**
+ * Wait for all async stream operations to complete.
+ */
+void cuda_sync_streams(void);
+
+/**
+ * Maximum performance fused kernel with all Phase 2 optimizations.
+ *
+ * Combines:
+ * - Fused RMSNorm + MatMul kernel
+ * - CUDA streams for async operations
+ * - Pinned memory for faster transfers
+ *
+ * @param input     Input activations (host memory) [K * N]
+ * @param output    Output buffer (host memory) [M * N]
+ * @param M         Number of output rows
+ * @param N         Number of output columns (batch size)
+ * @param K         Hidden size / input dimension
+ * @param eps       Epsilon for RMSNorm numerical stability
+ * @return 0 on success, -1 on failure
+ */
+int fused_rmsnorm_matmul_cuda_fast(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+);
+
 #ifdef __cplusplus
 }
 #endif

@@ -726,4 +726,364 @@ int rmsnorm_cuda_persistent(
     return 0;
 }
 
+// ============================================================================
+// Phase 2: Kernel Fusion + CUDA Streams
+// ============================================================================
+
+// CUDA streams for async operations
+static cudaStream_t compute_stream = nullptr;
+static cudaStream_t transfer_stream = nullptr;
+static int streams_initialized = 0;
+
+// Pinned memory buffers for faster transfers
+static float* h_pinned_activations = nullptr;
+static float* h_pinned_output = nullptr;
+static int pinned_buffer_size = 0;
+
+/**
+ * Fused RMSNorm + T-MAC MatMul Kernel
+ *
+ * Combines normalization and matrix multiplication in one kernel launch.
+ * Benefits:
+ * - Eliminates intermediate buffer
+ * - Reduces kernel launch overhead
+ * - Better cache utilization
+ */
+__global__ void fused_rmsnorm_matmul_kernel(
+    const float* __restrict__ input,        // Input activations [batch_size * size]
+    const float* __restrict__ norm_weights, // Normalization weights [size]
+    const int8_t* __restrict__ matmul_weights, // Packed ternary weights [M * K/4]
+    const float* __restrict__ matmul_scales,   // Per-row scales [M]
+    float* __restrict__ output,             // Output [batch_size * M]
+    int size,                               // Input/hidden size (K)
+    int M,                                  // Output dimension
+    int N,                                  // Batch size
+    float eps
+) {
+    // Shared memory for:
+    // 1. Normalized input (reused as LUT base)
+    // 2. LUT for T-MAC
+    __shared__ float s_normalized[1024];  // Max hidden_size
+    __shared__ float s_rms;
+    __shared__ float lut[LUT_SIZE][TILE_N];
+
+    int row = blockIdx.x;           // Output row (0 to M-1)
+    int col_base = blockIdx.y * TILE_N;  // Output column base
+    int tid = threadIdx.x;
+    int batch_idx = 0;  // For now, batch_size = 1
+
+    if (row >= M) return;
+
+    // =========== Step 1: RMSNorm (collaborative) ===========
+    // All threads participate in computing RMS of input
+    float sum_sq = 0.0f;
+    for (int i = tid; i < size; i += BLOCK_SIZE) {
+        float val = input[batch_idx * size + i];
+        sum_sq += val * val;
+    }
+
+    // Reduce sum_sq within block
+    __shared__ float smem_reduce[BLOCK_SIZE];
+    smem_reduce[tid] = sum_sq;
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem_reduce[tid] += smem_reduce[tid + s];
+        }
+        __syncthreads();
+    }
+
+    // Thread 0 computes final RMS
+    if (tid == 0) {
+        s_rms = rsqrtf(smem_reduce[0] / size + eps);
+    }
+    __syncthreads();
+
+    // Apply normalization and store in shared memory
+    float rms = s_rms;
+    for (int i = tid; i < size; i += BLOCK_SIZE) {
+        s_normalized[i] = input[batch_idx * size + i] * rms * norm_weights[i];
+    }
+    __syncthreads();
+
+    // =========== Step 2: T-MAC MatMul (using normalized input) ===========
+    // Initialize LUT to zero
+    for (int i = tid; i < LUT_SIZE * TILE_N; i += BLOCK_SIZE) {
+        int lut_idx = i / TILE_N;
+        int col_off = i % TILE_N;
+        lut[lut_idx][col_off] = 0.0f;
+    }
+    __syncthreads();
+
+    // Build lookup table for this output row
+    float scale = matmul_scales[row];
+
+    // Process K dimension
+    for (int k = tid; k < size; k += BLOCK_SIZE) {
+        // Get packed weight (4 ternary values per byte)
+        int weight_idx = row * ((size + 3) / 4) + (k / 4);
+        int8_t packed = matmul_weights[weight_idx];
+
+        // Extract ternary value for this k (-1, 0, +1)
+        int shift = (k % 4) * 2;
+        int ternary = ((packed >> shift) & 0x3) - 1;
+
+        // Use normalized activation from shared memory
+        for (int col_off = 0; col_off < TILE_N && (col_base + col_off) < N; col_off++) {
+            // For batch_size=1, just use s_normalized[k]
+            float act = s_normalized[k];
+
+            // Quantize activation to 4-bit index
+            int act_idx = min(15, max(0, (int)((act + 1.0f) * 8.0f)));
+
+            // Accumulate based on ternary weight
+            if (ternary != 0) {
+                atomicAdd(&lut[act_idx][col_off], ternary * act);
+            }
+        }
+    }
+    __syncthreads();
+
+    // Reduce LUT to final output
+    for (int col_off = tid; col_off < TILE_N && (col_base + col_off) < N; col_off += BLOCK_SIZE) {
+        float sum = 0.0f;
+        for (int i = 0; i < LUT_SIZE; i++) {
+            sum += lut[i][col_off];
+        }
+        output[row * N + col_base + col_off] = sum * scale;
+    }
+}
+
+/**
+ * Initialize CUDA streams for async operations
+ */
+int cuda_init_streams() {
+    if (streams_initialized) return 0;
+
+    CUDA_CHECK(cudaStreamCreate(&compute_stream));
+    CUDA_CHECK(cudaStreamCreate(&transfer_stream));
+
+    streams_initialized = 1;
+    return 0;
+}
+
+/**
+ * Cleanup CUDA streams
+ */
+void cuda_cleanup_streams() {
+    if (!streams_initialized) return;
+
+    cudaStreamDestroy(compute_stream);
+    cudaStreamDestroy(transfer_stream);
+    compute_stream = nullptr;
+    transfer_stream = nullptr;
+    streams_initialized = 0;
+}
+
+/**
+ * Allocate pinned (page-locked) memory for faster transfers
+ */
+int cuda_alloc_pinned(int max_activations, int max_output) {
+    if (h_pinned_activations) {
+        cudaFreeHost(h_pinned_activations);
+    }
+    if (h_pinned_output) {
+        cudaFreeHost(h_pinned_output);
+    }
+
+    CUDA_CHECK(cudaMallocHost(&h_pinned_activations, max_activations * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&h_pinned_output, max_output * sizeof(float)));
+
+    pinned_buffer_size = max_activations;
+    printf("EdgeLLM: Allocated pinned memory (%d activations, %d output)\n",
+           max_activations, max_output);
+
+    return 0;
+}
+
+/**
+ * Free pinned memory
+ */
+void cuda_free_pinned() {
+    if (h_pinned_activations) {
+        cudaFreeHost(h_pinned_activations);
+        h_pinned_activations = nullptr;
+    }
+    if (h_pinned_output) {
+        cudaFreeHost(h_pinned_output);
+        h_pinned_output = nullptr;
+    }
+    pinned_buffer_size = 0;
+}
+
+/**
+ * Fused RMSNorm + T-MAC MatMul (Phase 2 optimization)
+ *
+ * Combines normalization and matrix multiplication in a single kernel launch.
+ * Requires:
+ * - Norm weights loaded via cuda_load_norm_weights()
+ * - Matmul weights loaded via cuda_load_weights()
+ */
+int fused_rmsnorm_matmul_cuda(
+    const float* input,
+    float* output,
+    int M,      // Output dimension
+    int N,      // Batch size (usually 1)
+    int K,      // Hidden size / input dimension
+    float eps
+) {
+    if (!cuda_initialized) {
+        fprintf(stderr, "CUDA not initialized. Call cuda_init() first.\n");
+        return -1;
+    }
+    if (!weights_on_gpu || !norm_weights_on_gpu) {
+        fprintf(stderr, "Weights not loaded. Load both norm and matmul weights first.\n");
+        return -1;
+    }
+
+    int input_size = K * N;
+    int out_size = M * N;
+
+    // Transfer input to device
+    CUDA_CHECK(cudaMemcpy(d_activations, input, input_size * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Launch fused kernel
+    dim3 grid(M, (N + TILE_N - 1) / TILE_N);
+    dim3 block(BLOCK_SIZE);
+
+    fused_rmsnorm_matmul_kernel<<<grid, block>>>(
+        d_activations,
+        d_persistent_norm_weights,
+        d_persistent_weights,
+        d_persistent_scales,
+        d_output,
+        K, M, N, eps
+    );
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Transfer output back
+    CUDA_CHECK(cudaMemcpy(output, d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
+/**
+ * Async version of T-MAC MatMul using CUDA streams
+ *
+ * Overlaps data transfer with computation when possible.
+ * Use cuda_sync_streams() to wait for completion.
+ */
+int tmac_matmul_cuda_async(
+    const float* activations,
+    float* output,
+    int M, int N, int K
+) {
+    if (!cuda_initialized || !weights_on_gpu) return -1;
+
+    if (!streams_initialized) {
+        cuda_init_streams();
+    }
+
+    int act_size = K * N;
+    int out_size = M * N;
+
+    // Async copy activations to device
+    CUDA_CHECK(cudaMemcpyAsync(d_activations, activations, act_size * sizeof(float),
+                                cudaMemcpyHostToDevice, transfer_stream));
+
+    // Wait for transfer to complete before computing
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream));
+
+    // Launch kernel on compute stream
+    dim3 grid(M, (N + TILE_N - 1) / TILE_N);
+    dim3 block(BLOCK_SIZE);
+
+    tmac_matmul_kernel<<<grid, block, 0, compute_stream>>>(
+        d_persistent_weights,
+        d_activations,
+        d_output,
+        d_persistent_scales,
+        M, N, K
+    );
+
+    // Async copy output back
+    CUDA_CHECK(cudaMemcpyAsync(output, d_output, out_size * sizeof(float),
+                                cudaMemcpyDeviceToHost, compute_stream));
+
+    return 0;
+}
+
+/**
+ * Wait for all async operations to complete
+ */
+void cuda_sync_streams() {
+    if (compute_stream) cudaStreamSynchronize(compute_stream);
+    if (transfer_stream) cudaStreamSynchronize(transfer_stream);
+}
+
+/**
+ * Fused RMSNorm + MatMul with async streams and pinned memory
+ *
+ * Maximum performance version combining all Phase 2 optimizations.
+ */
+int fused_rmsnorm_matmul_cuda_fast(
+    const float* input,
+    float* output,
+    int M, int N, int K,
+    float eps
+) {
+    if (!cuda_initialized || !weights_on_gpu || !norm_weights_on_gpu) return -1;
+
+    if (!streams_initialized) {
+        cuda_init_streams();
+    }
+
+    int input_size = K * N;
+    int out_size = M * N;
+
+    // Use pinned memory if available for faster transfer
+    if (h_pinned_activations && input_size <= pinned_buffer_size) {
+        memcpy(h_pinned_activations, input, input_size * sizeof(float));
+        CUDA_CHECK(cudaMemcpyAsync(d_activations, h_pinned_activations,
+                                    input_size * sizeof(float),
+                                    cudaMemcpyHostToDevice, transfer_stream));
+    } else {
+        CUDA_CHECK(cudaMemcpy(d_activations, input, input_size * sizeof(float),
+                              cudaMemcpyHostToDevice));
+    }
+
+    // Sync transfer before compute
+    CUDA_CHECK(cudaStreamSynchronize(transfer_stream));
+
+    // Launch fused kernel
+    dim3 grid(M, (N + TILE_N - 1) / TILE_N);
+    dim3 block(BLOCK_SIZE);
+
+    fused_rmsnorm_matmul_kernel<<<grid, block, 0, compute_stream>>>(
+        d_activations,
+        d_persistent_norm_weights,
+        d_persistent_weights,
+        d_persistent_scales,
+        d_output,
+        K, M, N, eps
+    );
+
+    // Async copy output using pinned memory
+    if (h_pinned_output && out_size <= pinned_buffer_size) {
+        CUDA_CHECK(cudaMemcpyAsync(h_pinned_output, d_output,
+                                    out_size * sizeof(float),
+                                    cudaMemcpyDeviceToHost, compute_stream));
+        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        memcpy(output, h_pinned_output, out_size * sizeof(float));
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(compute_stream));
+        CUDA_CHECK(cudaMemcpy(output, d_output, out_size * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+    }
+
+    return 0;
+}
+
 } // extern "C"
