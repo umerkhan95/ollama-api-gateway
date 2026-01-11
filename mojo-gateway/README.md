@@ -1,293 +1,347 @@
-# EdgeLLM - Fine-tune, Optimize, Deploy LLMs to Edge
+# EdgeLLM Engine
 
-> **Fine-tune once, deploy everywhere** - from cloud to edge with deterministic performance.
+High-performance LLM inference engine with deterministic latency for edge devices. Built with Mojo and C FFI kernels using BitNet 1.58-bit quantization.
 
-EdgeLLM is a platform for fine-tuning, optimizing, and deploying custom LLMs to edge devices. Built with **Mojo** for deterministic latency (no garbage collection) and hybrid **C FFI kernels** for maximum throughput.
+## Features
 
-## Why EdgeLLM?
+- **15.5x lower latency jitter** than Ollama (373ms vs 5,799ms)
+- **6.5x model compression** with BitNet 1.58-bit quantization
+- **Deterministic performance** - no garbage collection pauses
+- **Runs on $15 hardware** - Raspberry Pi Zero compatible
+- **Offline capable** - no internet required
 
-| Problem | EdgeLLM Solution |
-|---------|------------------|
-| Cloud LLMs are expensive | **$0 per request** - run on-device |
-| Cloud LLMs need internet | **100% offline** capable |
-| Privacy concerns | **Data never leaves device** |
-| Unpredictable latency | **Deterministic** - no GC pauses |
-| Generic models don't fit | **Fine-tune** for your specific use case |
-| Edge devices have limited RAM | **BitNet 1.58-bit** - 10x smaller models |
+## Quick Start (Docker)
 
-## Performance Targets
-
-| Hardware | Model | Speed | Memory |
-|----------|-------|-------|--------|
-| Raspberry Pi Zero 2 W ($15) | SmolLM-135M | 5-10 tok/s | 150MB |
-| Raspberry Pi 5 | Llama-1B | 20-40 tok/s | 400MB |
-| Jetson Nano | Qwen-0.5B | 15-25 tok/s | 250MB |
-| Mac M1/M2 | Llama-3B | 40-60 tok/s | 1GB |
-
-## Quick Start
-
-### 1. Fine-Tune (FREE on Google Colab)
+The easiest way to run EdgeLLM is with Docker:
 
 ```bash
-# Use our Colab notebook or run locally
-edgellm finetune \
-    --base-model smollm-135m \
-    --data ./my_dataset.jsonl \
-    --output ./my_model
+# Clone the repository
+git clone https://github.com/yourusername/edgellm.git
+cd edgellm/mojo-gateway
+
+# Build the Docker image
+docker build -f Dockerfile.mojo -t edgellm-inference .
+
+# Run inference (generates 20 tokens)
+docker run --rm -v $(pwd)/models:/workspace/models \
+    edgellm-inference \
+    /workspace/bin/edgellm /workspace/models/smollm-135m.tm2.bin -n 20 -t 0.7
 ```
 
-### 2. Quantize to BitNet
-
-```bash
-edgellm quantize \
-    --input ./my_model \
-    --format bitnet \
-    --output ./my_model.tmac2.bin
-```
-
-### 3. Deploy to Edge
-
-```bash
-# On your edge device
-edgellm serve \
-    --model ./my_model.tmac2.bin \
-    --port 8080
-```
-
-### 4. Use
-
-```bash
-curl localhost:8080/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       EDGELLM PLATFORM                           │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  FINE-TUNING (Python + HuggingFace)                         ││
-│  │  • QLoRA on FREE Colab/Kaggle                               ││
-│  │  • Support: SmolLM, Llama, Phi, Qwen                        ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                              ↓                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  QUANTIZATION                                                ││
-│  │  • BitNet 1.58-bit (10x smaller)                            ││
-│  │  • T-MAC format (multiplication-free)                        ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                              ↓                                   │
-│  ┌─────────────────────────────────────────────────────────────┐│
-│  │  RUNTIME (Mojo + C FFI)                                      ││
-│  │  • Mojo: No GC, deterministic latency                       ││
-│  │  • C FFI: AVX2/NEON SIMD kernels                            ││
-│  │  • 20-50 tok/s on Raspberry Pi                              ││
-│  └─────────────────────────────────────────────────────────────┘│
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## Key Features
-
-### Deterministic Performance (No GC)
-```
-Python/Ollama:  P99 latency = P50 + 50-100ms (GC spikes)
-EdgeLLM (Mojo): P99 latency = P50 + 5-10ms (deterministic)
-```
-
-### BitNet 1.58-bit Quantization
-```
-Standard (FP16):  1B model = 2GB
-INT4 Quantized:   1B model = 500MB
-BitNet 1.58-bit:  1B model = 200MB ← 10x smaller!
-```
-
-### Fine-Tuning for Your Use Case
-```
-Generic 70B model on cloud:     "I don't have access to that information"
-Fine-tuned 1B model on device:  "Your living room lights are now on"
-```
-
-## Supported Models
-
-| Model | Parameters | BitNet Size | Min Hardware |
-|-------|------------|-------------|--------------|
-| SmolLM-135M | 135M | 35MB | Pi Zero 2 W |
-| SmolLM-360M | 360M | 90MB | Pi Zero 2 W |
-| Qwen2-0.5B | 500M | 125MB | Pi 4 |
-| Llama-3.2-1B | 1B | 200MB | Pi 5 |
-| Phi-3-mini | 3.8B | 750MB | Jetson |
-
-## Use Cases
-
-### Smart Home Assistant
-- Fine-tune on your device commands
-- Runs on Raspberry Pi ($35-80)
-- Instant responses, no cloud
-
-### Industrial IoT
-- Equipment-specific knowledge
-- Air-gapped deployment
-- Deterministic latency for real-time
-
-### Privacy-First Applications
-- Medical devices (HIPAA)
-- Financial services
-- Data never leaves device
-
-### Offline Capable
-- Remote locations
-- Intermittent connectivity
-- Edge of network
-
-## Cost Comparison
-
-| Approach | Hardware | Monthly Cost | Latency |
-|----------|----------|--------------|---------|
-| GPT-4 API | None | $100-1000+ | 500-2000ms |
-| Ollama (local) | $800+ PC | $0 | 100-200ms |
-| **EdgeLLM** | **$15 Pi Zero** | **$0** | **50-100ms** |
-
-## Installation
+## Installation (Native)
 
 ### Prerequisites
 
+**Linux (x86_64 or ARM64):**
 ```bash
-# Install Mojo
-curl -ssL https://magic.modular.com | bash
-magic install mojo
+# Install Mojo via pixi
+curl -fsSL https://pixi.sh/install.sh | sh
+pixi init -c https://conda.modular.com/max-nightly/ -c conda-forge
+pixi add mojo python>=3.11
 ```
 
-### Install EdgeLLM
-
+**macOS ARM64 (M1/M2/M3):**
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/edgellm.git
-cd edgellm
+# Native Mojo support
+curl -fsSL https://pixi.sh/install.sh | sh
+pixi init -c https://conda.modular.com/max-nightly/ -c conda-forge
+pixi add mojo
+```
 
-# Install dependencies
-pip install -e cli/
-
-# Build Mojo runtime
-pixi run build
+**macOS Intel (x86_64):**
+```bash
+# Use Docker (native Mojo not supported on Intel Mac)
+docker build -f Dockerfile.mojo -t edgellm-inference .
 ```
 
 ### Build from Source
 
 ```bash
-# Build Mojo runtime
-mojo build -O3 src/edgellm/runtime/inference.mojo -o bin/edgellm
+# 1. Build C kernel
+cd src/kernels
+make clean all
 
-# Build C kernel (x86)
-cd src/kernels && make
+# 2. Build Mojo inference binary
+pixi run mojo build -O3 src/bitnet_tmac_lut.mojo -o bin/edgellm
 
-# Or for ARM
-cd src/kernels && make arm
+# 3. Verify build
+./bin/edgellm --help
 ```
 
-## Documentation
+## Model Preparation
 
-- [Implementation Plan](IMPLEMENTATION_PLAN.md) - Full project roadmap
-- [Fine-Tuning Guide](docs/fine-tuning-guide.md) - How to fine-tune models
-- [Deployment Guide](docs/deployment-guide.md) - Deploy to edge devices
-- [API Reference](docs/api-reference.md) - REST API documentation
-- [Optimization Details](docs/cpu_register_optimization.md) - Technical deep-dive
+### Option 1: Download Pre-quantized Model
+
+```bash
+# Create models directory
+mkdir -p models
+
+# Download SmolLM-135M (BitNet quantized)
+# (Replace with actual download link when available)
+wget -O models/smollm-135m.tm2.bin https://example.com/smollm-135m.tm2.bin
+```
+
+### Option 2: Quantize Your Own Model
+
+```bash
+# Install Python dependencies
+pip install torch transformers safetensors numpy
+
+# Step 1: Quantize HuggingFace model to TMAC format
+python scripts/quantize/quantize_bitnet.py \
+    --input HuggingFaceTB/SmolLM-135M \
+    --output models/smollm-135m.tmac.bin
+
+# Step 2: Convert TMAC to TM2 format (for Mojo runtime)
+python scripts/convert_tmac_to_tm2.py \
+    models/smollm-135m.tmac.bin \
+    models/smollm-135m.tm2.bin
+```
+
+### Supported Models
+
+| Model | Parameters | TM2 Size | Min RAM |
+|-------|------------|----------|---------|
+| SmolLM-135M | 135M | 40 MB | 256 MB |
+| SmolLM-360M | 360M | 90 MB | 512 MB |
+| Qwen2-0.5B | 500M | 125 MB | 1 GB |
+| Llama-3.2-1B | 1B | 200 MB | 2 GB |
+
+## Running Inference
+
+### Basic Usage
+
+```bash
+# Generate 32 tokens with temperature 0.7
+./bin/edgellm models/smollm-135m.tm2.bin -n 32 -t 0.7
+
+# Greedy decoding (temperature 0)
+./bin/edgellm models/smollm-135m.tm2.bin -n 50 -t 0
+
+# Custom top-p sampling
+./bin/edgellm models/smollm-135m.tm2.bin -n 32 -t 0.8 -p 0.95
+```
+
+### Command Line Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-n <tokens>` | Number of tokens to generate | 32 |
+| `-t <temp>` | Temperature (0 = greedy) | 0.7 |
+| `-p <topp>` | Top-p nucleus sampling | 0.9 |
+
+### Docker Usage
+
+```bash
+# Interactive mode
+docker run -it --rm \
+    -v $(pwd)/models:/workspace/models \
+    edgellm-inference bash
+
+# Inside container
+/workspace/bin/edgellm /workspace/models/smollm-135m.tm2.bin -n 50
+
+# One-liner inference
+docker run --rm -v $(pwd)/models:/workspace/models \
+    edgellm-inference \
+    /workspace/bin/edgellm /workspace/models/smollm-135m.tm2.bin -n 32 -t 0.5
+```
+
+## Benchmarking
+
+### Run Performance Benchmark
+
+```bash
+# EdgeLLM benchmark (in Docker)
+docker run --rm \
+    -v $(pwd)/models:/workspace/models \
+    -v $(pwd)/results:/workspace/results \
+    edgellm-inference \
+    python3 /workspace/benchmarks/edgellm_benchmark.py \
+        --backend edgellm \
+        --model /workspace/models/smollm-135m.tm2.bin \
+        --runs 30 \
+        --output /workspace/results/benchmark.json
+
+# View results
+cat results/benchmark.json | python3 -m json.tool
+```
+
+### Compare with Ollama
+
+```bash
+# Start Ollama (if not running)
+ollama serve &
+ollama pull smollm:135m
+
+# Run Ollama benchmark
+python3 benchmarks/edgellm_benchmark.py \
+    --backend ollama \
+    --model smollm:135m \
+    --runs 30 \
+    --output results/ollama.json
+```
+
+### Expected Performance
+
+| Metric | EdgeLLM | Ollama |
+|--------|---------|--------|
+| Throughput | 8 tok/s | 136 tok/s |
+| Jitter | 373 ms | 5,799 ms |
+| P99 Latency | 5.5 sec | 19.7 sec |
+| Model Size | 40 MB | 91 MB |
+
+**Note:** EdgeLLM prioritizes deterministic latency over raw throughput.
 
 ## Project Structure
 
 ```
-edgellm/
-├── IMPLEMENTATION_PLAN.md      # Project roadmap
-├── README.md                   # This file
+mojo-gateway/
+├── bin/                        # Compiled binaries
+│   └── edgellm                 # Main inference binary
+├── lib/                        # Shared libraries
+│   └── libtmac_kernel.so       # C FFI kernel
+├── models/                     # Model files (.tm2.bin)
+├── results/                    # Benchmark results
 ├── src/
-│   ├── edgellm/               # Mojo runtime
-│   │   ├── runtime/           # Inference engine
-│   │   ├── ops/               # SIMD operations
-│   │   └── ffi/               # C FFI wrappers
-│   └── kernels/               # C FFI kernels
-│       ├── tmac_kernel.c      # AVX2/NEON kernel
+│   ├── bitnet_tmac_lut.mojo    # Main inference code
+│   └── kernels/
+│       ├── tmac_kernel.c       # AVX2/NEON SIMD kernel
 │       └── Makefile
-├── cli/                       # CLI tool
-│   └── edgellm/              # Python CLI
 ├── scripts/
-│   ├── finetune/             # Fine-tuning scripts
-│   └── quantize/             # Quantization tools
-├── notebooks/
-│   └── finetune_colab.ipynb  # FREE Colab notebook
-├── examples/                  # Example use cases
-└── docs/                     # Documentation
+│   ├── quantize/               # Quantization tools
+│   │   └── quantize_bitnet.py
+│   └── convert_tmac_to_tm2.py  # Format converter
+├── benchmarks/
+│   ├── edgellm_benchmark.py    # Performance benchmark
+│   └── quality_metrics.py      # Output quality testing
+├── Dockerfile.mojo             # Docker build file
+└── BENCHMARK_REPORT.md         # Detailed benchmark results
 ```
 
-## Benchmarks
+## Configuration
 
-### Latency Consistency
+### Environment Variables
 
-| System | P50 | P99 | Jitter |
-|--------|-----|-----|--------|
-| Python + GC | 50ms | 120ms | 70ms |
-| Ollama | 48ms | 95ms | 47ms |
-| **EdgeLLM** | **48ms** | **55ms** | **7ms** |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `LD_LIBRARY_PATH` | Path to libtmac_kernel.so | `./lib` |
+| `MOJO_ENABLE_STACK_TRACE_ON_ERROR` | Enable stack traces | unset |
 
-### Throughput (1B Model)
+### Memory Requirements
 
-| Hardware | Ollama (Q4) | EdgeLLM (BitNet) |
-|----------|-------------|------------------|
-| Raspberry Pi 5 | 10-15 tok/s | 20-40 tok/s |
-| Mac M1 | 30-40 tok/s | 40-60 tok/s |
-| Intel i7 | 25-35 tok/s | 35-50 tok/s |
+The model requires approximately:
+- **Model weights:** Size of .tm2.bin file
+- **KV Cache:** `2 × n_layers × seq_len × kv_dim × 4 bytes`
+- **Runtime buffers:** ~10-20 MB
 
-## Roadmap
+For SmolLM-135M with 2048 sequence length:
+- Model: 40 MB
+- KV Cache: ~70 MB
+- Total: ~120 MB RAM
 
-### Phase 1: Foundation (Current)
-- [x] T-MAC lookup table inference
-- [x] BitNet 1.58-bit support
-- [ ] Hybrid Mojo + C FFI runtime
-- [ ] SIMD RMSNorm/Softmax
+## Troubleshooting
 
-### Phase 2: Fine-Tuning Pipeline
-- [ ] QLoRA training scripts
-- [ ] Google Colab notebook
-- [ ] Quantization pipeline
-- [ ] Multiple model architectures
+### "Invalid model format" Error
 
-### Phase 3: CLI & API
-- [ ] EdgeLLM CLI tool
-- [ ] OpenAI-compatible API
-- [ ] Streaming support
+The model file must be in TM2 format. Convert if needed:
+```bash
+python scripts/convert_tmac_to_tm2.py input.tmac.bin output.tm2.bin
+```
 
-### Phase 4: Deployment
-- [ ] Raspberry Pi packages
-- [ ] Docker images
-- [ ] Fleet management (future)
+### "Library not found" Error
 
-## Contributing
+Ensure the C kernel is built and in the library path:
+```bash
+export LD_LIBRARY_PATH=$(pwd)/lib:$LD_LIBRARY_PATH
+```
 
-Contributions welcome! See [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for current priorities.
+### Docker Build Fails with "No space left"
+
+Clean Docker cache:
+```bash
+docker system prune -f
+docker builder prune -f
+```
+
+### Low Throughput
+
+- Ensure running on native hardware (not emulated)
+- Check CPU supports AVX2: `grep avx2 /proc/cpuinfo`
+- Use Docker with `--cpuset-cpus` for CPU pinning
+
+## Fine-Tuning (Optional)
+
+To fine-tune your own model:
 
 ```bash
-# Development setup
-git clone https://github.com/yourusername/edgellm.git
-cd edgellm
-pixi install
-pixi run test
+# 1. Prepare dataset (JSONL format)
+cat > data.jsonl << 'EOF'
+{"instruction": "Turn on the lights", "output": "Turning on living room lights"}
+{"instruction": "Set temperature to 72", "output": "Setting thermostat to 72°F"}
+EOF
+
+# 2. Fine-tune with QLoRA (requires GPU)
+python scripts/finetune/train_qlora.py \
+    --base-model HuggingFaceTB/SmolLM-135M \
+    --dataset data.jsonl \
+    --output ./my-model
+
+# 3. Merge LoRA weights
+python scripts/finetune/merge_lora.py \
+    --base-model HuggingFaceTB/SmolLM-135M \
+    --lora-path ./my-model \
+    --output ./my-model-merged
+
+# 4. Quantize to BitNet
+python scripts/quantize/quantize_bitnet.py \
+    --input ./my-model-merged \
+    --output ./my-model.tmac.bin
+
+# 5. Convert to TM2
+python scripts/convert_tmac_to_tm2.py \
+    ./my-model.tmac.bin \
+    ./my-model.tm2.bin
+```
+
+## API Reference
+
+### Inference Binary
+
+```
+Usage: edgellm <model_path> [options]
+
+Arguments:
+  model_path    Path to .tm2.bin model file
+
+Options:
+  -n <int>      Number of tokens to generate (default: 32)
+  -t <float>    Temperature for sampling (default: 0.7, 0 = greedy)
+  -p <float>    Top-p for nucleus sampling (default: 0.9)
+```
+
+### Python Benchmark API
+
+```python
+from benchmarks.edgellm_benchmark import benchmark_edgellm
+
+results = benchmark_edgellm(
+    model_path="models/smollm-135m.tm2.bin",
+    num_runs=30,
+    tokens_per_run=32
+)
+
+print(f"Throughput: {results['throughput']['mean']:.1f} tok/s")
+print(f"Jitter: {results['latency']['jitter']:.1f} ms")
 ```
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file.
+MIT License
 
 ## Acknowledgments
 
 - [Modular](https://www.modular.com/) - Mojo language
 - [T-MAC Paper](https://arxiv.org/abs/2407.00088) - Table lookup inference
 - [BitNet Paper](https://arxiv.org/abs/2402.17764) - 1.58-bit quantization
-- [QLoRA Paper](https://arxiv.org/abs/2305.14314) - Efficient fine-tuning
 - [llama2.c](https://github.com/karpathy/llama2.c) - Reference implementation
-
----
-
-**EdgeLLM** - LLMs for the edge, fine-tuned for your use case.
