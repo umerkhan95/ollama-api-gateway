@@ -261,10 +261,12 @@ struct RunState:
     var hb: Matrix
     var hb2: Matrix
     var q: Matrix
+    var k: Matrix  # Temporary K for current position
+    var v: Matrix  # Temporary V for current position
     var att: Matrix
     var logits: Matrix
-    var key_cache: Matrix
-    var value_cache: Matrix
+    var key_cache: Matrix    # [n_layers * n_kv_heads, seq_len, head_size] for CUDA compatibility
+    var value_cache: Matrix  # [n_layers * n_kv_heads, seq_len, head_size] for CUDA compatibility
 
     fn __init__(out self, config: Config):
         self.x = Matrix(config.dim)
@@ -273,10 +275,14 @@ struct RunState:
         self.hb = Matrix(config.hidden_dim)
         self.hb2 = Matrix(config.hidden_dim)
         self.q = Matrix(config.dim)
+        self.k = Matrix(config.kv_dim)  # Temp K
+        self.v = Matrix(config.kv_dim)  # Temp V
         self.att = Matrix(config.n_heads, config.seq_len)
         self.logits = Matrix(config.vocab_size)
-        self.key_cache = Matrix(config.n_layers, config.seq_len, config.kv_dim)
-        self.value_cache = Matrix(config.n_layers, config.seq_len, config.kv_dim)
+        # Cache layout: [n_layers * n_kv_heads, seq_len, head_size]
+        # This is compatible with CUDA kernel expecting [n_heads, cache_len, head_dim]
+        self.key_cache = Matrix(config.n_layers * config.n_kv_heads, config.seq_len, config.head_size)
+        self.value_cache = Matrix(config.n_layers * config.n_kv_heads, config.seq_len, config.head_size)
 
 
 struct CUDAKernels:
@@ -360,7 +366,7 @@ fn transformer_forward(
     mut state: RunState,
     weights: TransformerWeights,
 ) raises:
-    """Forward pass of the transformer."""
+    """Forward pass of the transformer with CUDA-compatible cache layout."""
     var dim = config.dim
     var hidden_dim = config.hidden_dim
     var head_size = config.head_size
@@ -368,6 +374,7 @@ fn transformer_forward(
     var kv_mul = config.kv_mul
     var n_heads = config.n_heads
     var n_kv_heads = config.n_kv_heads
+    var seq_len = config.seq_len
     var sqrt_head_size = math.sqrt(Float32(head_size))
 
     # Copy token embedding into x
@@ -386,19 +393,16 @@ fn transformer_forward(
         rmsnorm(state.xb, 0, state.x, 0,
                 weights.rms_att_weight, layer_dim_offset, dim)
 
-        # QKV projections
+        # QKV projections - Q, K, V to temp buffers
         var wq_offset = layer * dim * dim
         var wk_offset = layer * kv_dim * dim
         var wv_offset = layer * kv_dim * dim
 
         matmul(state.q, 0, state.xb, 0, weights.wq, wq_offset, dim, dim)
+        matmul(state.k, 0, state.xb, 0, weights.wk, wk_offset, kv_dim, dim)
+        matmul(state.v, 0, state.xb, 0, weights.wv, wv_offset, kv_dim, dim)
 
-        # K and V go into cache at current position
-        var cache_offset = layer * config.seq_len * kv_dim + pos * kv_dim
-        matmul(state.key_cache, cache_offset, state.xb, 0, weights.wk, wk_offset, kv_dim, dim)
-        matmul(state.value_cache, cache_offset, state.xb, 0, weights.wv, wv_offset, kv_dim, dim)
-
-        # Apply RoPE to Q and K
+        # Apply RoPE to Q and K (in temp buffers)
         for h in range(n_heads):
             for j in range(0, head_size, 2):
                 var fcr = weights.freq_cis_real[freq_offset + j // 2]
@@ -411,27 +415,39 @@ fn transformer_forward(
                 state.q[q_idx + 1] = q0 * fci + q1 * fcr
 
                 if h < n_kv_heads:
-                    var k_idx = cache_offset + h * head_size + j
-                    var k0 = state.key_cache[k_idx]
-                    var k1 = state.key_cache[k_idx + 1]
-                    state.key_cache[k_idx] = k0 * fcr - k1 * fci
-                    state.key_cache[k_idx + 1] = k0 * fci + k1 * fcr
+                    var k_idx = h * head_size + j
+                    var k0 = state.k[k_idx]
+                    var k1 = state.k[k_idx + 1]
+                    state.k[k_idx] = k0 * fcr - k1 * fci
+                    state.k[k_idx + 1] = k0 * fci + k1 * fcr
+
+        # Copy K, V to cache with CUDA-compatible layout [n_kv_heads, seq_len, head_size]
+        for h in range(n_kv_heads):
+            var cache_head_offset = (layer * n_kv_heads + h) * seq_len * head_size + pos * head_size
+            var src_offset = h * head_size
+            for i in range(head_size):
+                state.key_cache[cache_head_offset + i] = state.k[src_offset + i]
+                state.value_cache[cache_head_offset + i] = state.v[src_offset + i]
 
         # Zero xb for attention output
         state.xb.zero()
 
-        # Multihead attention
+        # Multihead attention (CPU path)
         for h in range(n_heads):
             var q_offset = h * head_size
-            var att_offset = h * config.seq_len
+            var att_offset = h * seq_len
+
+            # Which KV head does this Q head use? (for GQA)
+            var kv_head = h // kv_mul
+            var kv_head_cache_offset = (layer * n_kv_heads + kv_head) * seq_len * head_size
 
             # Compute attention scores for all positions
             for t in range(pos + 1):
-                var k_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                var k_offset = kv_head_cache_offset + t * head_size
 
                 var score: Float32 = 0.0
                 for i in range(head_size):
-                    score += state.q[q_offset + i] * state.key_cache[k_base + i]
+                    score += state.q[q_offset + i] * state.key_cache[k_offset + i]
                 state.att[att_offset + t] = score / sqrt_head_size
 
             # Softmax attention scores
@@ -440,10 +456,10 @@ fn transformer_forward(
             # Weighted sum of values
             var xb_offset = h * head_size
             for t in range(pos + 1):
-                var v_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                var v_offset = kv_head_cache_offset + t * head_size
                 var a = state.att[att_offset + t]
                 for i in range(head_size):
-                    state.xb[xb_offset + i] += a * state.value_cache[v_base + i]
+                    state.xb[xb_offset + i] += a * state.value_cache[v_offset + i]
 
         # Output projection
         var wo_offset = layer * dim * dim
@@ -465,8 +481,8 @@ fn transformer_forward(
 
         # SiLU and element-wise multiply
         for i in range(hidden_dim):
-            var v = state.hb[i]
-            state.hb[i] = v * (1.0 / (1.0 + math.exp(-v))) * state.hb2[i]
+            var val = state.hb[i]
+            state.hb[i] = val * (1.0 / (1.0 + math.exp(-val))) * state.hb2[i]
 
         # w2 projection
         var w2_offset = layer * dim * hidden_dim
@@ -555,55 +571,78 @@ fn print_token(tok: Tokenizer, token: Int):
 
 
 struct CUDAInference:
-    """CUDA-accelerated inference using EdgeLLM kernels."""
+    """CUDA-accelerated inference using stateless attention kernel."""
     var flash_attn: DLHandle
-    var rmsnorm: DLHandle
     var available: Bool
     var initialized: Bool
+    var n_heads: Int
+    var max_seq: Int
+    var head_dim: Int
 
     fn __init__(out self, lib_dir: String) raises:
         self.available = False
         self.initialized = False
+        self.n_heads = 0
+        self.max_seq = 0
+        self.head_dim = 0
 
         # Try to load CUDA libraries
         try:
             self.flash_attn = DLHandle(lib_dir + "/libflash_attention_int8.so")
-            self.rmsnorm = DLHandle(lib_dir + "/librmsnorm_kernel.so")
             self.available = True
-            print("CUDA libraries loaded successfully")
+            print("CUDA library loaded:", lib_dir + "/libflash_attention_int8.so")
         except:
             self.flash_attn = DLHandle("")
-            self.rmsnorm = DLHandle("")
-            print("CUDA libraries not available")
+            print("CUDA library not available")
 
-    fn init_attention(mut self, n_heads: Int, max_seq: Int, head_dim: Int) -> Bool:
-        """Initialize INT8 Flash Attention."""
+    fn init_stateless_attention(mut self, n_heads: Int, max_seq: Int, head_dim: Int) -> Bool:
+        """Initialize stateless attention (no internal KV cache)."""
         if not self.available:
             return False
 
         var ret = self.flash_attn.call[
-            "flash_attention_int8_init",
+            "attention_stateless_init",
             Int32,
             Int32, Int32, Int32
         ](Int32(n_heads), Int32(max_seq), Int32(head_dim))
 
         if ret == 0:
             self.initialized = True
-            print("INT8 Flash Attention initialized: heads=", n_heads, "seq=", max_seq, "dim=", head_dim)
+            self.n_heads = n_heads
+            self.max_seq = max_seq
+            self.head_dim = head_dim
+            print("Stateless Attention initialized: heads=", n_heads, "seq=", max_seq, "dim=", head_dim)
             return True
         else:
-            print("Flash Attention init failed")
+            print("Stateless Attention init failed")
             return False
 
-    fn reset_kv_cache(mut self):
-        """Reset KV cache position."""
-        if self.initialized:
-            self.flash_attn.call["flash_attention_int8_reset", NoneType]()
+    fn attention(self,
+                 q_ptr: UnsafePointer[Float32],
+                 k_cache_ptr: UnsafePointer[Float32],
+                 v_cache_ptr: UnsafePointer[Float32],
+                 o_ptr: UnsafePointer[Float32],
+                 n_heads: Int,
+                 cache_len: Int,
+                 head_dim: Int) -> Int:
+        """Execute stateless attention with external KV cache."""
+        if not self.initialized:
+            return -1
+
+        return Int(self.flash_attn.call[
+            "attention_stateless_fast",
+            Int32,
+            UnsafePointer[Float32], UnsafePointer[Float32],
+            UnsafePointer[Float32], UnsafePointer[Float32],
+            Int32, Int32, Int32
+        ](q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
+          Int32(n_heads), Int32(cache_len), Int32(head_dim)))
 
     fn cleanup(mut self):
         """Cleanup CUDA resources."""
         if self.initialized:
-            self.flash_attn.call["flash_attention_int8_cleanup", NoneType]()
+            self.flash_attn.call["attention_stateless_cleanup", NoneType]()
+            self.initialized = False
 
 
 fn transformer_forward_cuda(
@@ -614,7 +653,7 @@ fn transformer_forward_cuda(
     weights: TransformerWeights,
     cuda: CUDAInference,
 ) raises:
-    """CUDA-accelerated forward pass using INT8 Flash Attention."""
+    """CUDA-accelerated forward pass using stateless attention with per-layer KV caches."""
     var dim = config.dim
     var hidden_dim = config.hidden_dim
     var head_size = config.head_size
@@ -622,6 +661,7 @@ fn transformer_forward_cuda(
     var kv_mul = config.kv_mul
     var n_heads = config.n_heads
     var n_kv_heads = config.n_kv_heads
+    var seq_len = config.seq_len
     var sqrt_head_size = math.sqrt(Float32(head_size))
 
     # Copy token embedding into x
@@ -636,23 +676,20 @@ fn transformer_forward_cuda(
     for layer in range(config.n_layers):
         var layer_dim_offset = layer * dim
 
-        # Attention rmsnorm (CPU - small operation)
+        # Attention rmsnorm
         rmsnorm(state.xb, 0, state.x, 0,
                 weights.rms_att_weight, layer_dim_offset, dim)
 
-        # QKV projections (CPU)
+        # QKV projections - Q, K, V to temp buffers
         var wq_offset = layer * dim * dim
         var wk_offset = layer * kv_dim * dim
         var wv_offset = layer * kv_dim * dim
 
         matmul(state.q, 0, state.xb, 0, weights.wq, wq_offset, dim, dim)
+        matmul(state.k, 0, state.xb, 0, weights.wk, wk_offset, kv_dim, dim)
+        matmul(state.v, 0, state.xb, 0, weights.wv, wv_offset, kv_dim, dim)
 
-        # K and V go into cache at current position
-        var cache_offset = layer * config.seq_len * kv_dim + pos * kv_dim
-        matmul(state.key_cache, cache_offset, state.xb, 0, weights.wk, wk_offset, kv_dim, dim)
-        matmul(state.value_cache, cache_offset, state.xb, 0, weights.wv, wv_offset, kv_dim, dim)
-
-        # Apply RoPE to Q and K
+        # Apply RoPE to Q and K (in temp buffers)
         for h in range(n_heads):
             for j in range(0, head_size, 2):
                 var fcr = weights.freq_cis_real[freq_offset + j // 2]
@@ -665,72 +702,94 @@ fn transformer_forward_cuda(
                 state.q[q_idx + 1] = q0 * fci + q1 * fcr
 
                 if h < n_kv_heads:
-                    var k_idx = cache_offset + h * head_size + j
-                    var k0 = state.key_cache[k_idx]
-                    var k1 = state.key_cache[k_idx + 1]
-                    state.key_cache[k_idx] = k0 * fcr - k1 * fci
-                    state.key_cache[k_idx + 1] = k0 * fci + k1 * fcr
+                    var k_idx = h * head_size + j
+                    var k0 = state.k[k_idx]
+                    var k1 = state.k[k_idx + 1]
+                    state.k[k_idx] = k0 * fcr - k1 * fci
+                    state.k[k_idx + 1] = k0 * fci + k1 * fcr
 
-        # Use INT8 Flash Attention for attention computation
+        # Copy K, V to cache with CUDA-compatible layout [n_kv_heads, seq_len, head_size]
+        for h in range(n_kv_heads):
+            var cache_head_offset = (layer * n_kv_heads + h) * seq_len * head_size + pos * head_size
+            var src_offset = h * head_size
+            for i in range(head_size):
+                state.key_cache[cache_head_offset + i] = state.k[src_offset + i]
+                state.value_cache[cache_head_offset + i] = state.v[src_offset + i]
+
+        # Use CUDA stateless attention with per-layer KV caches
         if cuda.initialized:
-            # Get pointers for CUDA kernel
+            # Get pointers for this layer's KV cache
+            var layer_cache_offset = layer * n_kv_heads * seq_len * head_size
             var q_ptr = state.q.data.unsafe_ptr()
-            var k_ptr = state.key_cache.data.unsafe_ptr() + cache_offset
-            var v_ptr = state.value_cache.data.unsafe_ptr() + cache_offset
+            var k_cache_ptr = state.key_cache.data.unsafe_ptr() + layer_cache_offset
+            var v_cache_ptr = state.value_cache.data.unsafe_ptr() + layer_cache_offset
             var o_ptr = state.xb.data.unsafe_ptr()
 
-            # Call INT8 Flash Attention decode kernel
-            # This handles KV cache internally
-            var ret = cuda.flash_attn.call[
-                "flash_attention_int8_decode_fp32",
-                Int32,
-                UnsafePointer[Float32], UnsafePointer[Float32],
-                UnsafePointer[Float32], UnsafePointer[Float32],
-                Int32, Int32, Int32
-            ](q_ptr, k_ptr, v_ptr, o_ptr,
-              Int32(n_heads), Int32(pos), Int32(head_size))
+            # Call stateless attention - kernel receives external KV cache
+            # Note: For GQA (n_heads != n_kv_heads), we pass n_kv_heads to kernel
+            # and handle head mapping on output side
+            var ret = cuda.attention(q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
+                                     n_kv_heads, pos + 1, head_size)
 
             if ret != 0:
                 # Fallback to CPU attention if CUDA fails
                 state.xb.zero()
                 for h in range(n_heads):
                     var q_offset = h * head_size
-                    var att_offset = h * config.seq_len
+                    var att_offset = h * seq_len
+                    var kv_head = h // kv_mul
+                    var kv_head_cache_offset = (layer * n_kv_heads + kv_head) * seq_len * head_size
+
                     for t in range(pos + 1):
-                        var k_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                        var k_offset = kv_head_cache_offset + t * head_size
                         var score: Float32 = 0.0
                         for i in range(head_size):
-                            score += state.q[q_offset + i] * state.key_cache[k_base + i]
+                            score += state.q[q_offset + i] * state.key_cache[k_offset + i]
                         state.att[att_offset + t] = score / sqrt_head_size
+
                     softmax(state.att, att_offset, pos + 1)
+
                     var xb_offset = h * head_size
                     for t in range(pos + 1):
-                        var v_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                        var v_offset = kv_head_cache_offset + t * head_size
                         var a = state.att[att_offset + t]
                         for i in range(head_size):
-                            state.xb[xb_offset + i] += a * state.value_cache[v_base + i]
+                            state.xb[xb_offset + i] += a * state.value_cache[v_offset + i]
+            else:
+                # CUDA kernel outputs [n_kv_heads, head_size], need to expand for GQA
+                if n_heads != n_kv_heads:
+                    # GQA: Copy each KV head output to multiple Q heads
+                    for h in range(n_heads - 1, -1, -1):  # Reverse to avoid overwrite
+                        var kv_head = h // kv_mul
+                        var src_offset = kv_head * head_size
+                        var dst_offset = h * head_size
+                        if src_offset != dst_offset:
+                            for i in range(head_size):
+                                state.xb[dst_offset + i] = state.xb[src_offset + i]
         else:
             # CPU attention fallback
             state.xb.zero()
             for h in range(n_heads):
                 var q_offset = h * head_size
-                var att_offset = h * config.seq_len
+                var att_offset = h * seq_len
+                var kv_head = h // kv_mul
+                var kv_head_cache_offset = (layer * n_kv_heads + kv_head) * seq_len * head_size
 
                 for t in range(pos + 1):
-                    var k_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                    var k_offset = kv_head_cache_offset + t * head_size
                     var score: Float32 = 0.0
                     for i in range(head_size):
-                        score += state.q[q_offset + i] * state.key_cache[k_base + i]
+                        score += state.q[q_offset + i] * state.key_cache[k_offset + i]
                     state.att[att_offset + t] = score / sqrt_head_size
 
                 softmax(state.att, att_offset, pos + 1)
 
                 var xb_offset = h * head_size
                 for t in range(pos + 1):
-                    var v_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                    var v_offset = kv_head_cache_offset + t * head_size
                     var a = state.att[att_offset + t]
                     for i in range(head_size):
-                        state.xb[xb_offset + i] += a * state.value_cache[v_base + i]
+                        state.xb[xb_offset + i] += a * state.value_cache[v_offset + i]
 
         # Output projection
         var wo_offset = layer * dim * dim
@@ -752,8 +811,8 @@ fn transformer_forward_cuda(
 
         # SiLU and element-wise multiply
         for i in range(hidden_dim):
-            var v = state.hb[i]
-            state.hb[i] = v * (1.0 / (1.0 + math.exp(-v))) * state.hb2[i]
+            var val = state.hb[i]
+            state.hb[i] = val * (1.0 / (1.0 + math.exp(-val))) * state.hb2[i]
 
         # w2 projection
         var w2_offset = layer * dim * hidden_dim
@@ -821,12 +880,13 @@ fn main() raises:
     var tokenizer = Tokenizer(config.vocab_size, tokenizer_path)
     var state = RunState(config)
 
-    # Initialize CUDA if requested
+    # Initialize CUDA if requested (using stateless attention for per-layer KV caches)
     var cuda = CUDAInference(lib_dir)
     if use_cuda and cuda.available:
-        var ok = cuda.init_attention(config.n_heads, config.seq_len, config.head_size)
+        # Use n_kv_heads since that's what the kernel operates on
+        var ok = cuda.init_stateless_attention(config.n_kv_heads, config.seq_len, config.head_size)
         if ok:
-            print("Backend: CUDA (INT8 Flash Attention)")
+            print("Backend: CUDA (Stateless Attention)")
         else:
             use_cuda = False
             print("Backend: CPU (CUDA init failed)")
@@ -895,4 +955,4 @@ fn main() raises:
         var tok_per_sec = tokens_generated * 1000 // Int(elapsed_ms)
         print("Speed:", tok_per_sec, "tokens/sec")
     if use_cuda:
-        print("Backend: CUDA (INT8 Flash Attention)")
+        print("Backend: CUDA (Stateless Attention)")
