@@ -432,13 +432,150 @@ int benchmark_int8_throughput() {
     return 0;
 }
 
+/**
+ * Benchmark __dp4a optimized kernel with statistics
+ */
+int benchmark_dp4a_optimized() {
+    printf("\n=== __dp4a Optimized INT8 Attention Benchmark ===\n");
+
+    // Qwen 0.5B configuration
+    int num_heads = 14;
+    int head_dim = 64;
+    int batch = 1;
+    int batch_heads = batch * num_heads;
+    int num_layers = 24;  // Qwen 0.5B
+    int cache_len = 256;
+
+    flash_attention_int8_init(batch_heads, 2048, head_dim);
+
+    int single_size = batch_heads * head_dim;
+    float* Q = (float*)malloc(single_size * sizeof(float));
+    float* K = (float*)malloc(single_size * sizeof(float));
+    float* V = (float*)malloc(single_size * sizeof(float));
+    float* O = (float*)malloc(single_size * sizeof(float));
+
+    srand(42);
+
+    // Fill cache
+    for (int pos = 0; pos < cache_len; pos++) {
+        fill_random(K, single_size);
+        fill_random(V, single_size);
+        flash_attention_int8_decode_fp32(Q, K, V, O, batch_heads, pos, head_dim);
+    }
+
+    fill_random(Q, single_size);
+    fill_random(K, single_size);
+    fill_random(V, single_size);
+
+    printf("\nQwen 2.5 0.5B Configuration:\n");
+    printf("  Heads: %d\n", num_heads);
+    printf("  Head dim: %d\n", head_dim);
+    printf("  Layers: %d\n", num_layers);
+    printf("  Cache length: %d\n", cache_len);
+
+    // Warmup
+    printf("\nWarmup: %d iterations...\n", WARMUP_RUNS);
+    for (int i = 0; i < WARMUP_RUNS; i++) {
+        flash_attention_int8_decode_fp32(Q, K, V, O, batch_heads, cache_len - 1, head_dim);
+    }
+    cudaDeviceSynchronize();
+
+    // Collect per-iteration latencies
+    int runs = 200;
+    double* latencies = (double*)malloc(runs * sizeof(double));
+
+    printf("Benchmark: %d iterations...\n", runs);
+    for (int i = 0; i < runs; i++) {
+        auto start = std::chrono::high_resolution_clock::now();
+        flash_attention_int8_decode_fp32(Q, K, V, O, batch_heads, cache_len - 1, head_dim);
+        cudaDeviceSynchronize();
+        auto end = std::chrono::high_resolution_clock::now();
+        latencies[i] = std::chrono::duration<double, std::micro>(end - start).count();
+    }
+
+    // Sort for percentiles
+    for (int i = 0; i < runs - 1; i++) {
+        for (int j = i + 1; j < runs; j++) {
+            if (latencies[j] < latencies[i]) {
+                double tmp = latencies[i];
+                latencies[i] = latencies[j];
+                latencies[j] = tmp;
+            }
+        }
+    }
+
+    double min_us = latencies[0];
+    double max_us = latencies[runs - 1];
+    double median_us = latencies[runs / 2];
+    double p95_us = latencies[(int)(runs * 0.95)];
+    double p99_us = latencies[(int)(runs * 0.99)];
+
+    double mean_us = 0;
+    for (int i = 0; i < runs; i++) mean_us += latencies[i];
+    mean_us /= runs;
+
+    double variance = 0;
+    for (int i = 0; i < runs; i++) {
+        double diff = latencies[i] - mean_us;
+        variance += diff * diff;
+    }
+    double std_us = sqrt(variance / runs);
+
+    // Convert to ms
+    double median_ms = median_us / 1000.0;
+    double per_token_attn_ms = median_ms * num_layers;
+    double attn_throughput = 1000.0 / per_token_attn_ms;
+
+    double attention_fraction = 0.35;
+    double per_token_total_ms = per_token_attn_ms / attention_fraction;
+    double estimated_throughput = 1000.0 / per_token_total_ms;
+
+    printf("\n=== __dp4a Kernel Results ===\n");
+    printf("  Layer latency (median): %.2f us (%.4f ms)\n", median_us, median_ms);
+    printf("  Layer latency (mean):   %.2f ± %.2f us\n", mean_us, std_us);
+    printf("  Layer latency (min):    %.2f us\n", min_us);
+    printf("  Layer latency (max):    %.2f us\n", max_us);
+    printf("  Layer latency (P95):    %.2f us\n", p95_us);
+    printf("  Layer latency (P99):    %.2f us\n", p99_us);
+    printf("  Jitter (std/median):    %.2f%%\n", (std_us / median_us) * 100);
+    printf("\n");
+    printf("  Per-token attention (%d layers): %.3f ms\n", num_layers, per_token_attn_ms);
+    printf("  Attention-only throughput:       %.1f tok/s\n", attn_throughput);
+    printf("  Estimated total throughput:      %.1f tok/s\n", estimated_throughput);
+
+    printf("\nJSON Output:\n");
+    printf("{\n");
+    printf("  \"kernel\": \"INT8_dp4a_optimized\",\n");
+    printf("  \"model\": \"Qwen_2.5_0.5B\",\n");
+    printf("  \"layer_latency_us\": %.2f,\n", median_us);
+    printf("  \"layer_latency_ms\": %.4f,\n", median_ms);
+    printf("  \"std_us\": %.2f,\n", std_us);
+    printf("  \"p95_us\": %.2f,\n", p95_us);
+    printf("  \"p99_us\": %.2f,\n", p99_us);
+    printf("  \"per_token_attn_ms\": %.3f,\n", per_token_attn_ms);
+    printf("  \"attn_throughput\": %.1f,\n", attn_throughput);
+    printf("  \"estimated_throughput\": %.1f,\n", estimated_throughput);
+    printf("  \"target_throughput\": 630,\n");
+    printf("  \"ollama_baseline\": 423\n");
+    printf("}\n");
+
+    free(Q);
+    free(K);
+    free(V);
+    free(O);
+    free(latencies);
+    flash_attention_int8_cleanup();
+
+    return 0;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
 
 int main() {
-    printf("INT8 Tensor Core Flash Attention Test Suite\n");
-    printf("============================================\n");
+    printf("INT8 __dp4a Tensor Core Flash Attention Test Suite\n");
+    printf("===================================================\n");
 
     // Check CUDA availability
     int device_count;
@@ -469,7 +606,10 @@ int main() {
     benchmark_int8_vs_fp32();
     benchmark_int8_throughput();
 
-    printf("\n============================================\n");
+    // Run optimized __dp4a benchmark
+    benchmark_dp4a_optimized();
+
+    printf("\n===================================================\n");
     if (failed == 0) {
         printf("All tests PASSED!\n");
     } else {

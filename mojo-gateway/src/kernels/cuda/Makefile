@@ -103,6 +103,26 @@ $(FA2_TARGET): flash_attention_v2.o
 fa2: dirs flash_attention_v2.o $(FA2_TARGET)
 	@echo "Built FlashAttention-2 (tiled, online softmax)"
 
+# FlashAttention-2 Optimized (WMMA + GPU-Resident + FlashDecoding++)
+FA2_OPT_TARGET = $(LIB_DIR)/libflash_attention_v2_optimized.$(SHARED_EXT)
+
+flash_attention_v2_optimized.o: flash_attention_v2_optimized.cu flash_attention_v2_optimized.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(FA2_OPT_TARGET): flash_attention_v2_optimized.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built FlashAttention-2 Optimized: $(FA2_OPT_TARGET)"
+
+# Build Optimized FlashAttention-2
+fa2-opt: dirs flash_attention_v2_optimized.o $(FA2_OPT_TARGET)
+	@echo "Built FlashAttention-2 Optimized (WMMA, GPU-Resident, Split-K)"
+
+# Test optimized FA2
+test-fa2-opt: dirs flash_attention_v2_optimized.o
+	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_flash_attention_v2_optimized test_flash_attention_v2_optimized.cu flash_attention_v2_optimized.o -lcudart
+	@echo "Running Optimized FlashAttention-2 tests..."
+	$(BIN_DIR)/test_flash_attention_v2_optimized
+
 # FlashAttention-2 Multi-GPU (tensor parallel with NCCL)
 FA2_MG_TARGET = $(LIB_DIR)/libflash_attention_v2_multi_gpu.$(SHARED_EXT)
 
@@ -124,12 +144,12 @@ test-fa2-multi-gpu: dirs flash_attention_v2.o flash_attention_v2_multi_gpu.o
 	$(BIN_DIR)/test_flash_attention_v2_multi_gpu
 
 # Build all attention variants
-all-attention: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET)
-	@echo "Built all attention kernels (FP32, INT8, FA2)"
+all-attention: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_OPT_TARGET)
+	@echo "Built all attention kernels (FP32, INT8, FA2, FA2-Optimized)"
 
 # Build all attention variants including multi-GPU
-all-attention-multi-gpu: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET)
-	@echo "Built all attention kernels (FP32, INT8, FA2, Multi-GPU)"
+all-attention-multi-gpu: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET) $(FA2_OPT_TARGET)
+	@echo "Built all attention kernels (FP32, INT8, FA2, Multi-GPU, Optimized)"
 
 # Test binary
 test: dirs $(OBJECTS)
@@ -163,8 +183,8 @@ test-all-multi-gpu: test-all test-fa2-multi-gpu
 
 # Clean
 clean:
-	rm -f $(OBJECTS) flash_attention_int8.o flash_attention_v2.o flash_attention_v2_multi_gpu.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET)
-	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8 $(BIN_DIR)/test_flash_attention_v2_multi_gpu
+	rm -f $(OBJECTS) flash_attention_int8.o flash_attention_v2.o flash_attention_v2_multi_gpu.o flash_attention_v2_optimized.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET) $(FA2_MG_TARGET) $(FA2_OPT_TARGET)
+	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8 $(BIN_DIR)/test_flash_attention_v2_multi_gpu $(BIN_DIR)/test_flash_attention_v2_optimized
 
 # Install to system (optional)
 install: $(TARGET)
@@ -227,6 +247,7 @@ info:
 	@echo "  make flash      - Build with Flash Attention (FP32)"
 	@echo "  make int8       - Build INT8 Tensor Core Flash Attention"
 	@echo "  make fa2        - Build FlashAttention-2 (tiled)"
+	@echo "  make fa2-opt    - Build FlashAttention-2 Optimized (WMMA+GPU-Resident+Split-K)"
 	@echo "  make fa2-multi-gpu - Build Multi-GPU FlashAttention-2 (NCCL)"
 	@echo "  make all-int8   - Build all including INT8"
 	@echo "  make all-attention - Build all attention variants"
@@ -242,6 +263,8 @@ info:
 	@echo "  make test       - Run T-MAC kernel tests"
 	@echo "  make test-flash - Run Flash Attention tests (FP32)"
 	@echo "  make test-int8  - Run INT8 Flash Attention tests"
+	@echo "  make test-fa2-accuracy - Run FA2 accuracy tests"
+	@echo "  make test-fa2-opt      - Run Optimized FA2 tests"
 	@echo "  make test-fa2-multi-gpu - Run Multi-GPU FA2 tests"
 	@echo "  make test-all   - Run all tests"
 	@echo "  make test-all-multi-gpu - Run all tests including multi-GPU"

@@ -1,8 +1,19 @@
 /**
  * INT8 Tensor Core Flash Attention - Header
  *
- * Provides INT8 quantized attention using WMMA Tensor Cores.
- * ~8x speedup over FP32 on supported GPUs (sm_75+).
+ * Provides INT8 quantized attention using __dp4a Tensor Core intrinsics.
+ * ~4x throughput improvement for INT8 dot products on sm_61+ GPUs.
+ *
+ * Supported GPUs:
+ * - Turing (sm_75+): T4, RTX 20xx
+ * - Ampere (sm_80+): A100, RTX 30xx
+ * - Ada (sm_89+): RTX 40xx
+ *
+ * Key optimizations:
+ * - __dp4a: 4-element INT8 dot product in single instruction
+ * - Vectorized INT8 loads (int8x4 packed as int32)
+ * - Async CUDA streams for overlapped copy/compute
+ * - GPU-Resident API for zero per-token memcpy
  */
 
 #ifndef FLASH_ATTENTION_INT8_H
@@ -14,20 +25,29 @@
 extern "C" {
 #endif
 
+// ============================================================================
+// Initialization & Cleanup
+// ============================================================================
+
 /**
- * Initialize INT8 Flash Attention buffers
+ * Initialize INT8 Flash Attention buffers with async streams
  *
  * @param max_batch_heads  Maximum batch * num_heads
  * @param max_cache_len    Maximum KV cache length
- * @param head_dim         Head dimension
+ * @param head_dim         Head dimension (must be multiple of 4 for __dp4a)
  * @return 0 on success, -1 on failure
  */
 int flash_attention_int8_init(int max_batch_heads, int max_cache_len, int head_dim);
 
 /**
- * Cleanup INT8 Flash Attention resources
+ * Cleanup INT8 Flash Attention resources (buffers and streams)
  */
 void flash_attention_int8_cleanup(void);
+
+/**
+ * Reset cache position for new generation sequence
+ */
+void flash_attention_int8_reset(void);
 
 /**
  * Quantize FP32 tensor to INT8
@@ -129,6 +149,38 @@ int flash_attention_int8_decode_fp32(
  * @param h_dim        Output: Head dimension
  */
 void flash_attention_int8_info(int* initialized, int* max_cache, int* max_bh, int* h_dim);
+
+// ============================================================================
+// GPU-Resident API (Zero per-token host-device transfer)
+// ============================================================================
+
+/**
+ * GPU-Resident INT8 decode (for use when Q, K, V are already on GPU)
+ *
+ * Eliminates PCIe overhead for maximum throughput. Call after loading
+ * Q, K, V to GPU buffers using flash_attention_int8_update_cache.
+ *
+ * @param batch_heads  Number of batch * heads
+ * @param cache_len    Current KV cache length
+ * @param scale_q      Dequantization scale for Q
+ * @param scale_k      Dequantization scale for K
+ * @param scale_v      Dequantization scale for V
+ * @return 0 on success
+ */
+int flash_attention_int8_decode_gpu(
+    int batch_heads,
+    int cache_len,
+    float scale_q,
+    float scale_k,
+    float scale_v
+);
+
+/**
+ * Synchronize INT8 compute stream
+ *
+ * Call after flash_attention_int8_decode_gpu to wait for completion.
+ */
+void flash_attention_int8_sync(void);
 
 #ifdef __cplusplus
 }

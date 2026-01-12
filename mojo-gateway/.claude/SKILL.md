@@ -1,8 +1,63 @@
 # EdgeLLM CUDA Optimization Roadmap
 
-## Current Performance (Jan 11, 2026)
+## CRITICAL: Benchmark Methodology
 
-### Phase 2.1 Results: VICTORY! EdgeLLM BEATS OLLAMA
+**ALWAYS use the definitive benchmark notebook**: `notebooks/edgellm_definitive_benchmark.ipynb`
+
+This ensures:
+- Consistent methodology (50 warmup, 200 runs)
+- Statistical analysis (median, P50/P95/P99, IQR outlier removal)
+- Reproducible baselines that don't change
+- Apples-to-apples comparison
+
+**DO NOT** create ad-hoc benchmarks that produce inconsistent numbers.
+
+---
+
+## Kaggle Notebook Workflow (Playwright MCP)
+
+### Efficient Workflow (Avoid Excessive Token Usage)
+
+1. **Open Kaggle**: `mcp__playwright__browser_navigate` to kaggle.com
+2. **Login**: Fill credentials, wait for redirect
+3. **Create Notebook**: Navigate to "Create" → "New Notebook"
+4. **Enable GPU**: Settings → Accelerator → GPU T4 x2
+5. **Upload Notebook**:
+   - Use File → Upload to upload the `.ipynb` directly
+   - OR copy cells one at a time using `mcp__playwright__browser_type`
+6. **Run All**: Click "Run All" button
+7. **Wait**: Use `mcp__playwright__browser_wait_for` with specific output text
+8. **Capture Results**: Take screenshot or copy output text
+
+### Key Efficiency Tips
+- **Upload entire notebook** instead of typing cell-by-cell (saves 10x tokens)
+- **Use "Run All"** instead of running cells individually
+- **Wait for specific text** (e.g., "Benchmark complete") instead of arbitrary sleeps
+- **Snapshot once** at the end, not after each cell
+- **Check for errors early** - if build fails, don't continue running benchmarks
+
+### Common Issues
+- "Maximum interactive GPU session count of 1": Stop previous session first
+- Kernel disconnects: Refresh page, re-run cells
+- Build failures: Check CUDA_ARCH matches GPU (T4=sm_75, A100=sm_80)
+
+---
+
+## Current Performance (Jan 12, 2026)
+
+### IMPORTANT: Separate Benchmarks for Separate Systems
+
+| System | What It Measures | Best Result |
+|--------|------------------|-------------|
+| T-MAC Kernels | BitNet quantized matmul (SmolLM-135M) | 630 tok/s |
+| FA2 Kernels | FlashAttention-2 attention only | 145 tok/s (needs optimization) |
+| Ollama | Full model inference | 320-423 tok/s |
+
+**The 630 tok/s is T-MAC, not FA2. Don't confuse them.**
+
+---
+
+## Phase 2.1 Results: T-MAC BEATS OLLAMA (SmolLM-135M)
 
 | Engine | Per Token | Throughput | vs Ollama |
 |--------|-----------|------------|-----------|
@@ -280,3 +335,101 @@ If matching datacenter GPU performance proves difficult:
 - IoT/embedded (memory constrained)
 - Privacy-sensitive (offline operation)
 - Battery-powered (lower energy per token)
+
+---
+
+## FlashAttention-2 Optimization Plan (Jan 12, 2026)
+
+### Current FA2 Performance Problem
+
+| Model | Ollama | EdgeLLM FA2 | Gap |
+|-------|--------|-------------|-----|
+| Qwen 0.5B | 320 tok/s | 145 tok/s | **2.2x slower** |
+| Qwen 1.5B | 138 tok/s | 124 tok/s | 1.1x slower |
+
+**Jitter is excellent** (80,000-550,000x better), but **throughput needs work**.
+
+### Root Cause Analysis
+
+From `flash_attention_v2.cu`:
+
+1. **CUDA Cores only** (lines 125-133): Using scalar FMA, not Tensor Cores
+2. **Host-Device copies every call** (lines 492, 520): 0.5-2ms per token wasted
+3. **Synchronized softmax** (lines 143-206): 20% overhead from barriers
+
+### 3-Point Optimization Strategy
+
+See `KERNEL_OPTIMIZATION_STRATEGY.md` for full details.
+
+#### Point 1: Tensor Cores (WMMA) - 4-6x Expected Speedup
+
+**Research**: [FlashAttention-3](https://arxiv.org/html/2407.08608v2), [CUTLASS](https://arxiv.org/html/2312.11918v1)
+
+```cuda
+// Current (20 TFLOPs)
+for (int d = 0; d < head_dim; d++)
+    score += q[d] * k[d];
+
+// Target (300 TFLOPs)
+#include <mma.h>
+wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+```
+
+T4 supports WMMA 16x16x16 FP16→FP32.
+
+#### Point 2: GPU-Resident Inference - 1.5-3x Expected Speedup
+
+**Research**: [Mirage Persistent Kernel](https://arxiv.org/html/2512.22219v1)
+
+```
+Current:  Host ─memcpy→ GPU ─kernel→ GPU ─memcpy→ Host  (per token!)
+Target:   Host ─memcpy→ [GPU runs entire generation] ─memcpy→ Host
+```
+
+Eliminate PCIe round-trips by keeping all inference on GPU.
+
+#### Point 3: FlashDecoding++ - 1.3-1.5x Expected Speedup
+
+**Research**: [FlashDecoding++](https://proceedings.mlsys.org/paper_files/paper/2024/file/5321b1dabcd2be188d796c21b733e8c7-Paper-Conference.pdf) (MLSys 2024)
+
+Three sub-optimizations:
+1. **Unified Max Value**: Remove softmax sync barriers
+2. **Flat GEMM**: Adaptive tiling for [1, seq_len] shapes
+3. **Split-K**: Parallelize over sequence length, not just heads
+
+### Combined Expected Result
+
+| Optimization | Individual | Cumulative |
+|--------------|------------|------------|
+| Baseline | 1.0x | 145 tok/s |
+| Tensor Cores | 4-6x | 580-870 tok/s |
+| GPU-Resident | 1.5-2x | 870-1740 tok/s |
+| FlashDecoding++ | 1.3-1.5x | **1130-2610 tok/s** |
+
+**Conservative Target: 480+ tok/s** (beat Ollama by 50%)
+
+### Implementation Priority
+
+1. **Tensor Cores (WMMA)** - Highest ROI, single biggest change
+2. **GPU-Resident** - Eliminates host-device transfer overhead
+3. **FlashDecoding++** - Polish for additional gains
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `flash_attention_v2.cu` | Add WMMA, remove cudaMemcpy per call |
+| `flash_attention_v2.h` | Add persistent inference API |
+| `Makefile` | Add WMMA flags |
+
+---
+
+## Benchmark Reference Documents
+
+| Document | Purpose |
+|----------|---------|
+| `notebooks/edgellm_definitive_benchmark.ipynb` | FROZEN benchmark methodology |
+| `KERNEL_OPTIMIZATION_STRATEGY.md` | 3-point FA2 optimization plan |
+| `BENCHMARK_PLAN.md` | Model testing plan |
+
+**Always use the definitive benchmark notebook for consistent results.**
