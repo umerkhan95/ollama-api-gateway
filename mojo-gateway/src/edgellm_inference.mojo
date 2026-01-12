@@ -554,12 +554,233 @@ fn print_token(tok: Tokenizer, token: Int):
         print(s, end="")
 
 
+struct CUDAInference:
+    """CUDA-accelerated inference using EdgeLLM kernels."""
+    var flash_attn: DLHandle
+    var rmsnorm: DLHandle
+    var available: Bool
+    var initialized: Bool
+
+    fn __init__(out self, lib_dir: String) raises:
+        self.available = False
+        self.initialized = False
+
+        # Try to load CUDA libraries
+        try:
+            self.flash_attn = DLHandle(lib_dir + "/libflash_attention_int8.so")
+            self.rmsnorm = DLHandle(lib_dir + "/librmsnorm_kernel.so")
+            self.available = True
+            print("CUDA libraries loaded successfully")
+        except:
+            self.flash_attn = DLHandle("")
+            self.rmsnorm = DLHandle("")
+            print("CUDA libraries not available")
+
+    fn init_attention(mut self, n_heads: Int, max_seq: Int, head_dim: Int) -> Bool:
+        """Initialize INT8 Flash Attention."""
+        if not self.available:
+            return False
+
+        var ret = self.flash_attn.call[
+            "flash_attention_int8_init",
+            Int32,
+            Int32, Int32, Int32
+        ](Int32(n_heads), Int32(max_seq), Int32(head_dim))
+
+        if ret == 0:
+            self.initialized = True
+            print("INT8 Flash Attention initialized: heads=", n_heads, "seq=", max_seq, "dim=", head_dim)
+            return True
+        else:
+            print("Flash Attention init failed")
+            return False
+
+    fn reset_kv_cache(mut self):
+        """Reset KV cache position."""
+        if self.initialized:
+            self.flash_attn.call["flash_attention_int8_reset", NoneType]()
+
+    fn cleanup(mut self):
+        """Cleanup CUDA resources."""
+        if self.initialized:
+            self.flash_attn.call["flash_attention_int8_cleanup", NoneType]()
+
+
+fn transformer_forward_cuda(
+    token: Int,
+    pos: Int,
+    config: Config,
+    mut state: RunState,
+    weights: TransformerWeights,
+    cuda: CUDAInference,
+) raises:
+    """CUDA-accelerated forward pass using INT8 Flash Attention."""
+    var dim = config.dim
+    var hidden_dim = config.hidden_dim
+    var head_size = config.head_size
+    var kv_dim = config.kv_dim
+    var kv_mul = config.kv_mul
+    var n_heads = config.n_heads
+    var n_kv_heads = config.n_kv_heads
+    var sqrt_head_size = math.sqrt(Float32(head_size))
+
+    # Copy token embedding into x
+    var emb_offset = token * dim
+    for i in range(dim):
+        state.x[i] = weights.token_embedding[emb_offset + i]
+
+    # Frequency components for RoPE
+    var freq_offset = pos * (head_size // 2)
+
+    # Forward through layers
+    for layer in range(config.n_layers):
+        var layer_dim_offset = layer * dim
+
+        # Attention rmsnorm (CPU - small operation)
+        rmsnorm(state.xb, 0, state.x, 0,
+                weights.rms_att_weight, layer_dim_offset, dim)
+
+        # QKV projections (CPU)
+        var wq_offset = layer * dim * dim
+        var wk_offset = layer * kv_dim * dim
+        var wv_offset = layer * kv_dim * dim
+
+        matmul(state.q, 0, state.xb, 0, weights.wq, wq_offset, dim, dim)
+
+        # K and V go into cache at current position
+        var cache_offset = layer * config.seq_len * kv_dim + pos * kv_dim
+        matmul(state.key_cache, cache_offset, state.xb, 0, weights.wk, wk_offset, kv_dim, dim)
+        matmul(state.value_cache, cache_offset, state.xb, 0, weights.wv, wv_offset, kv_dim, dim)
+
+        # Apply RoPE to Q and K
+        for h in range(n_heads):
+            for j in range(0, head_size, 2):
+                var fcr = weights.freq_cis_real[freq_offset + j // 2]
+                var fci = weights.freq_cis_imag[freq_offset + j // 2]
+
+                var q_idx = h * head_size + j
+                var q0 = state.q[q_idx]
+                var q1 = state.q[q_idx + 1]
+                state.q[q_idx] = q0 * fcr - q1 * fci
+                state.q[q_idx + 1] = q0 * fci + q1 * fcr
+
+                if h < n_kv_heads:
+                    var k_idx = cache_offset + h * head_size + j
+                    var k0 = state.key_cache[k_idx]
+                    var k1 = state.key_cache[k_idx + 1]
+                    state.key_cache[k_idx] = k0 * fcr - k1 * fci
+                    state.key_cache[k_idx + 1] = k0 * fci + k1 * fcr
+
+        # Use INT8 Flash Attention for attention computation
+        if cuda.initialized:
+            # Get pointers for CUDA kernel
+            var q_ptr = state.q.data.unsafe_ptr()
+            var k_ptr = state.key_cache.data.unsafe_ptr() + cache_offset
+            var v_ptr = state.value_cache.data.unsafe_ptr() + cache_offset
+            var o_ptr = state.xb.data.unsafe_ptr()
+
+            # Call INT8 Flash Attention decode kernel
+            # This handles KV cache internally
+            var ret = cuda.flash_attn.call[
+                "flash_attention_int8_decode_fp32",
+                Int32,
+                UnsafePointer[Float32], UnsafePointer[Float32],
+                UnsafePointer[Float32], UnsafePointer[Float32],
+                Int32, Int32, Int32
+            ](q_ptr, k_ptr, v_ptr, o_ptr,
+              Int32(n_heads), Int32(pos), Int32(head_size))
+
+            if ret != 0:
+                # Fallback to CPU attention if CUDA fails
+                state.xb.zero()
+                for h in range(n_heads):
+                    var q_offset = h * head_size
+                    var att_offset = h * config.seq_len
+                    for t in range(pos + 1):
+                        var k_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                        var score: Float32 = 0.0
+                        for i in range(head_size):
+                            score += state.q[q_offset + i] * state.key_cache[k_base + i]
+                        state.att[att_offset + t] = score / sqrt_head_size
+                    softmax(state.att, att_offset, pos + 1)
+                    var xb_offset = h * head_size
+                    for t in range(pos + 1):
+                        var v_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                        var a = state.att[att_offset + t]
+                        for i in range(head_size):
+                            state.xb[xb_offset + i] += a * state.value_cache[v_base + i]
+        else:
+            # CPU attention fallback
+            state.xb.zero()
+            for h in range(n_heads):
+                var q_offset = h * head_size
+                var att_offset = h * config.seq_len
+
+                for t in range(pos + 1):
+                    var k_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                    var score: Float32 = 0.0
+                    for i in range(head_size):
+                        score += state.q[q_offset + i] * state.key_cache[k_base + i]
+                    state.att[att_offset + t] = score / sqrt_head_size
+
+                softmax(state.att, att_offset, pos + 1)
+
+                var xb_offset = h * head_size
+                for t in range(pos + 1):
+                    var v_base = layer * config.seq_len * kv_dim + t * kv_dim + (h // kv_mul) * head_size
+                    var a = state.att[att_offset + t]
+                    for i in range(head_size):
+                        state.xb[xb_offset + i] += a * state.value_cache[v_base + i]
+
+        # Output projection
+        var wo_offset = layer * dim * dim
+        matmul(state.xb2, 0, state.xb, 0, weights.wo, wo_offset, dim, dim)
+
+        # Residual connection
+        for i in range(dim):
+            state.x[i] += state.xb2[i]
+
+        # FFN rmsnorm
+        rmsnorm(state.xb, 0, state.x, 0,
+                weights.rms_ffn_weight, layer_dim_offset, dim)
+
+        # FFN: w1 and w3
+        var w1_offset = layer * hidden_dim * dim
+        var w3_offset = layer * hidden_dim * dim
+        matmul(state.hb, 0, state.xb, 0, weights.w1, w1_offset, hidden_dim, dim)
+        matmul(state.hb2, 0, state.xb, 0, weights.w3, w3_offset, hidden_dim, dim)
+
+        # SiLU and element-wise multiply
+        for i in range(hidden_dim):
+            var v = state.hb[i]
+            state.hb[i] = v * (1.0 / (1.0 + math.exp(-v))) * state.hb2[i]
+
+        # w2 projection
+        var w2_offset = layer * dim * hidden_dim
+        matmul(state.xb, 0, state.hb, 0, weights.w2, w2_offset, dim, hidden_dim)
+
+        # Residual connection
+        for i in range(dim):
+            state.x[i] += state.xb[i]
+
+    # Final rmsnorm
+    rmsnorm(state.xb, 0, state.x, 0, weights.rms_final_weight, 0, dim)
+
+    # Classifier
+    if weights.shared_weights:
+        matmul(state.logits, 0, state.xb, 0, weights.token_embedding, 0, config.vocab_size, dim)
+    else:
+        matmul(state.logits, 0, state.xb, 0, weights.wcls, 0, config.vocab_size, dim)
+
+
 fn main() raises:
     var checkpoint = "stories15M.bin"
     var tokenizer_path = "tokenizer.bin"
     var temperature: Float32 = 0.9
     var steps = 256
     var prompt = String("")
+    var use_cuda = False
+    var lib_dir = "./lib"
 
     var args = argv()
     if len(args) >= 2:
@@ -579,6 +800,12 @@ fn main() raises:
         elif args[i] == "-i" and i + 1 < len(args):
             prompt = args[i + 1]
             i += 2
+        elif args[i] == "--cuda":
+            use_cuda = True
+            i += 1
+        elif args[i] == "--lib" and i + 1 < len(args):
+            lib_dir = args[i + 1]
+            i += 2
         else:
             i += 1
 
@@ -593,6 +820,21 @@ fn main() raises:
     var weights = TransformerWeights(checkpoint, config)
     var tokenizer = Tokenizer(config.vocab_size, tokenizer_path)
     var state = RunState(config)
+
+    # Initialize CUDA if requested
+    var cuda = CUDAInference(lib_dir)
+    if use_cuda and cuda.available:
+        var ok = cuda.init_attention(config.n_heads, config.seq_len, config.head_size)
+        if ok:
+            print("Backend: CUDA (INT8 Flash Attention)")
+        else:
+            use_cuda = False
+            print("Backend: CPU (CUDA init failed)")
+    else:
+        if use_cuda:
+            print("Backend: CPU (CUDA not available)")
+        else:
+            print("Backend: CPU")
 
     if steps <= 0 or steps > config.seq_len:
         steps = config.seq_len
@@ -614,7 +856,10 @@ fn main() raises:
     var tokens_generated = 0
 
     for pos in range(steps):
-        transformer_forward(token, pos, config, state, weights)
+        if use_cuda and cuda.initialized:
+            transformer_forward_cuda(token, pos, config, state, weights, cuda)
+        else:
+            transformer_forward(token, pos, config, state, weights)
 
         var next_token: Int
         if pos < len(prompt_tokens):
@@ -638,6 +883,10 @@ fn main() raises:
     var end_time = time.perf_counter_ns()
     var elapsed_ms = (end_time - start_time) // 1_000_000
 
+    # Cleanup CUDA
+    if use_cuda and cuda.initialized:
+        cuda.cleanup()
+
     print()
     print()
     print("-" * 60)
@@ -645,3 +894,5 @@ fn main() raises:
     if elapsed_ms > 0:
         var tok_per_sec = tokens_generated * 1000 // Int(elapsed_ms)
         print("Speed:", tok_per_sec, "tokens/sec")
+    if use_cuda:
+        print("Backend: CUDA (INT8 Flash Attention)")
