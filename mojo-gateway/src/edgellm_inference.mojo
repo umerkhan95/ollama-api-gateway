@@ -4,7 +4,7 @@ Generates actual text output using CUDA-accelerated kernels.
 
 Compatible with:
 - Mojo 25.5.0 (no global vars, uses alias instead of comptime)
-- CUDA kernels via DLHandle FFI
+- CUDA kernels via OwnedDLHandle FFI
 - LLaMA/SmolLM model format
 
 Usage:
@@ -13,7 +13,7 @@ Usage:
 """
 from collections import List, Dict
 from sys import argv
-from sys.ffi import DLHandle
+from sys.ffi import OwnedOwnedDLHandle
 from memory import UnsafePointer
 import math
 import random
@@ -302,7 +302,7 @@ struct CUDAKernels:
     fn try_load(mut self) raises -> Bool:
         """Try to load CUDA kernel libraries."""
         try:
-            var test = DLHandle(self.flash_attn_path)
+            var test = OwnedDLHandle(self.flash_attn_path)
             _ = test
             self.available = True
             print("CUDA kernels available at:", self.flash_attn_path)
@@ -572,7 +572,7 @@ fn print_token(tok: Tokenizer, token: Int):
 
 struct CUDAInference:
     """CUDA-accelerated inference using stateless attention kernel."""
-    var flash_attn: DLHandle
+    var flash_attn: OwnedDLHandle
     var available: Bool
     var initialized: Bool
     var n_heads: Int
@@ -588,11 +588,11 @@ struct CUDAInference:
 
         # Try to load CUDA libraries
         try:
-            self.flash_attn = DLHandle(lib_dir + "/libflash_attention_int8.so")
+            self.flash_attn = OwnedDLHandle(lib_dir + "/libflash_attention_int8.so")
             self.available = True
             print("CUDA library loaded:", lib_dir + "/libflash_attention_int8.so")
         except:
-            self.flash_attn = DLHandle("")
+            self.flash_attn = OwnedDLHandle("")
             print("CUDA library not available")
 
     fn init_stateless_attention(mut self, n_heads: Int, max_seq: Int, head_dim: Int) -> Bool:
