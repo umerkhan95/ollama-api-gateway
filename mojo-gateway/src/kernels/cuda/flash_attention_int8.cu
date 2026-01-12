@@ -471,6 +471,9 @@ static int int8_max_cache_len = 0;
 static int int8_max_batch_heads = 0;
 static int int8_head_dim = 0;
 
+// Forward declaration
+void flash_attention_int8_cleanup(void);
+
 /**
  * Initialize INT8 Flash Attention buffers
  */
