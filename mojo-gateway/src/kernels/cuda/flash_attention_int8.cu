@@ -53,12 +53,100 @@ using namespace nvcuda;
 } while(0)
 
 // ============================================================================
-// Quantization Utilities
+// Quantization Utilities (Fixed for multi-block correctness)
 // ============================================================================
 
 /**
- * Quantize FP32 to INT8 with per-tensor scaling
- * Finds max absolute value and scales to [-127, 127]
+ * Pass 1: Find max absolute value per block, write to global partial_max array
+ */
+__global__ void find_max_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ partial_max,
+    int size
+) {
+    __shared__ float shared_max[256];
+
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+
+    // Each thread finds max in its strided range
+    float local_max = 0.0f;
+    for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(input[i]));
+    }
+
+    // Block reduction
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < blockDim.x) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // Block 0 thread 0 writes result
+    if (tid == 0) {
+        partial_max[blockIdx.x] = shared_max[0];
+    }
+}
+
+/**
+ * Pass 2: Reduce partial maxes to single value
+ */
+__global__ void reduce_max_kernel(
+    float* __restrict__ partial_max,
+    float* __restrict__ final_max,
+    int num_blocks
+) {
+    __shared__ float shared_max[256];
+
+    int tid = threadIdx.x;
+    float local_max = 0.0f;
+
+    for (int i = tid; i < num_blocks; i += blockDim.x) {
+        local_max = fmaxf(local_max, partial_max[i]);
+    }
+
+    shared_max[tid] = local_max;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < blockDim.x) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *final_max = shared_max[0];
+    }
+}
+
+/**
+ * Pass 3: Quantize with known scale
+ */
+__global__ void quantize_kernel(
+    const float* __restrict__ input,
+    int8_t* __restrict__ output,
+    float max_val,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float quant_scale = (max_val > 0.0f) ? (QUANT_SCALE / max_val) : 1.0f;
+
+    for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
+        float val = input[i] * quant_scale;
+        val = fminf(fmaxf(val, -127.0f), 127.0f);
+        output[i] = (int8_t)rintf(val);
+    }
+}
+
+/**
+ * Quantize FP32 to INT8 with per-tensor scaling (FIXED multi-block version)
+ * Host function that orchestrates the 3-pass quantization
  */
 __global__ void quantize_fp32_to_int8_kernel(
     const float* __restrict__ input,
@@ -66,43 +154,40 @@ __global__ void quantize_fp32_to_int8_kernel(
     float* __restrict__ scale,
     int size
 ) {
-    __shared__ float s_max;
+    // NOTE: This kernel is deprecated - use quantize_tensor_to_int8() instead
+    // Keeping for backward compatibility but it only works correctly for single block
+
+    __shared__ float shared_max[256];
 
     int tid = threadIdx.x;
     int idx = blockIdx.x * blockDim.x + tid;
 
-    // Find max absolute value (reduction)
+    // Find max (only correct for single block!)
     float local_max = 0.0f;
-    for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
+    for (int i = idx; i < size; i += blockDim.x) {
         local_max = fmaxf(local_max, fabsf(input[i]));
     }
 
-    // Block reduction
-    __shared__ float shared_max[256];
     shared_max[tid] = local_max;
     __syncthreads();
 
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
+        if (tid < s && tid + s < blockDim.x) {
             shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
         }
         __syncthreads();
     }
 
+    float max_val = shared_max[0];
+    float quant_scale = (max_val > 0.0f) ? (QUANT_SCALE / max_val) : 1.0f;
+
     if (tid == 0) {
-        atomicMax((int*)&s_max, __float_as_int(shared_max[0]));
+        *scale = max_val / QUANT_SCALE;
     }
     __syncthreads();
 
-    float max_val = s_max;
-    float quant_scale = (max_val > 0.0f) ? (QUANT_SCALE / max_val) : 1.0f;
-
-    if (tid == 0 && blockIdx.x == 0) {
-        *scale = max_val / QUANT_SCALE;  // Store dequant scale
-    }
-
     // Quantize
-    for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
+    for (int i = idx; i < size; i += blockDim.x) {
         float val = input[i] * quant_scale;
         val = fminf(fmaxf(val, -127.0f), 127.0f);
         output[i] = (int8_t)rintf(val);
@@ -1534,7 +1619,40 @@ int attention_stateless_fast(
 }
 
 /**
- * Strided stateless attention - handles non-contiguous KV cache
+ * Helper: Proper multi-block quantization
+ * Returns the max value (dequant scale = max / 127)
+ */
+static float quantize_tensor_proper(
+    const float* d_input,
+    int8_t* d_output,
+    int size,
+    float* d_partial_max,  // Workspace for partial maxes
+    int num_blocks
+) {
+    dim3 block(256);
+    dim3 grid(num_blocks);
+
+    // Pass 1: Find max per block
+    find_max_kernel<<<grid, block>>>(d_input, d_partial_max, size);
+
+    // Pass 2: Reduce to single max
+    float* d_final_max;
+    cudaMalloc(&d_final_max, sizeof(float));
+    reduce_max_kernel<<<1, 256>>>(d_partial_max, d_final_max, num_blocks);
+
+    float h_max;
+    cudaMemcpy(&h_max, d_final_max, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(d_final_max);
+
+    // Pass 3: Quantize with computed scale
+    quantize_kernel<<<grid, block>>>(d_input, d_output, h_max, size);
+
+    return h_max / QUANT_SCALE;  // Return dequant scale
+}
+
+/**
+ * Strided stateless INT8 attention - handles non-contiguous KV cache
+ * FIXED: Uses proper multi-block quantization
  *
  * Use when KV cache has layout [batch_heads, max_seq_len, head_dim]
  * but only cache_len positions are valid.
@@ -1569,13 +1687,13 @@ int attention_stateless_strided(
     }
 
     size_t q_size = batch_heads * head_dim * sizeof(float);
+    int q_elements = batch_heads * head_dim;
+    int kv_elements = batch_heads * cache_len * head_dim;
 
     // Copy Q (always contiguous)
     CUDA_CHECK(cudaMemcpy(d_attn_Q, Q, q_size, cudaMemcpyHostToDevice));
 
     // Copy K, V with stride handling
-    // Source layout: [batch_heads, buffer_seq_len, head_dim]
-    // We need: [batch_heads, cache_len, head_dim] contiguous on device
     for (int h = 0; h < batch_heads; h++) {
         size_t src_offset = h * buffer_seq_len * head_dim;
         size_t dst_offset = h * cache_len * head_dim;
@@ -1585,21 +1703,20 @@ int attention_stateless_strided(
         CUDA_CHECK(cudaMemcpy(d_attn_V + dst_offset, V_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
     }
 
-    // Quantize
-    dim3 qblock(256);
-    dim3 qgrid_q((batch_heads * head_dim + 255) / 256);
-    dim3 qgrid_kv((batch_heads * cache_len * head_dim + 255) / 256);
+    // Allocate workspace for quantization
+    int num_blocks_q = (q_elements + 255) / 256;
+    int num_blocks_kv = (kv_elements + 255) / 256;
+    int max_blocks = (num_blocks_q > num_blocks_kv) ? num_blocks_q : num_blocks_kv;
 
-    float* d_scale;
-    CUDA_CHECK(cudaMalloc(&d_scale, 3 * sizeof(float)));
+    float* d_partial_max;
+    CUDA_CHECK(cudaMalloc(&d_partial_max, max_blocks * sizeof(float)));
 
-    quantize_fp32_to_int8_kernel<<<qgrid_q, qblock>>>(d_attn_Q, d_attn_Q_i8, d_scale, batch_heads * head_dim);
-    quantize_fp32_to_int8_kernel<<<qgrid_kv, qblock>>>(d_attn_K, d_attn_K_i8, d_scale + 1, batch_heads * cache_len * head_dim);
-    quantize_fp32_to_int8_kernel<<<qgrid_kv, qblock>>>(d_attn_V, d_attn_V_i8, d_scale + 2, batch_heads * cache_len * head_dim);
+    // Proper multi-block quantization
+    float scale_q = quantize_tensor_proper(d_attn_Q, d_attn_Q_i8, q_elements, d_partial_max, num_blocks_q);
+    float scale_k = quantize_tensor_proper(d_attn_K, d_attn_K_i8, kv_elements, d_partial_max, num_blocks_kv);
+    float scale_v = quantize_tensor_proper(d_attn_V, d_attn_V_i8, kv_elements, d_partial_max, num_blocks_kv);
 
-    float h_scales[3];
-    CUDA_CHECK(cudaMemcpy(h_scales, d_scale, 3 * sizeof(float), cudaMemcpyDeviceToHost));
-    cudaFree(d_scale);
+    cudaFree(d_partial_max);
 
     float attn_scale = 1.0f / sqrtf((float)head_dim);
 
@@ -1612,7 +1729,7 @@ int attention_stateless_strided(
 
     flash_attention_int8_decode_kernel<<<grid, block, smem_size>>>(
         d_attn_Q_i8, d_attn_K_i8, d_attn_V_i8, d_attn_O,
-        h_scales[0], h_scales[1], h_scales[2],
+        scale_q, scale_k, scale_v,
         cache_len, head_dim, attn_scale
     );
     CUDA_CHECK(cudaDeviceSynchronize());
