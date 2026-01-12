@@ -293,26 +293,29 @@ struct RunState:
 
 struct CUDAKernels:
     """CUDA kernel handles for GPU acceleration."""
-    var flash_attn: DLHandle
-    var rmsnorm: DLHandle
-    var ffn: DLHandle
+    var flash_attn_path: String
+    var rmsnorm_path: String
+    var ffn_path: String
     var available: Bool
 
     fn __init__(out self, lib_dir: String):
         self.available = False
+        self.flash_attn_path = lib_dir + "/libflash_attention_int8.so"
+        self.rmsnorm_path = lib_dir + "/librmsnorm_kernel.so"
+        self.ffn_path = lib_dir + "/libffn_kernel.so"
+        # Actual loading happens in try_load()
 
+    fn try_load(mut self) raises -> Bool:
+        """Try to load CUDA kernel libraries."""
         try:
-            self.flash_attn = DLHandle(lib_dir + "/libflash_attention_int8.so")
-            self.rmsnorm = DLHandle(lib_dir + "/librmsnorm_kernel.so")
-            self.ffn = DLHandle(lib_dir + "/libffn_kernel.so")
+            var test = DLHandle(self.flash_attn_path)
+            _ = test
             self.available = True
-            print("CUDA kernels loaded successfully")
+            print("CUDA kernels available at:", self.flash_attn_path)
+            return True
         except:
-            # Fallback - create empty handles
-            self.flash_attn = DLHandle("")
-            self.rmsnorm = DLHandle("")
-            self.ffn = DLHandle("")
             print("CUDA kernels not available - using CPU fallback")
+            return False
 
 
 # =============================================================================
