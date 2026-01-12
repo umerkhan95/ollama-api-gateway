@@ -13,7 +13,7 @@ Usage:
 """
 from collections import List, Dict
 from sys import argv
-from sys.ffi import OwnedOwnedDLHandle
+from sys.ffi import OwnedDLHandle
 from memory import UnsafePointer
 import math
 import random
