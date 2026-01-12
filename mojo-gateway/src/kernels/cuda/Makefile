@@ -37,6 +37,7 @@ TARGET = $(LIB_DIR)/libtmac_kernel_cuda.$(SHARED_EXT)
 STATIC_TARGET = $(LIB_DIR)/libtmac_kernel_cuda.a
 FA_TARGET = $(LIB_DIR)/libflash_attention.$(SHARED_EXT)
 INT8_TARGET = $(LIB_DIR)/libflash_attention_int8.$(SHARED_EXT)
+FA2_TARGET = $(LIB_DIR)/libflash_attention_v2.$(SHARED_EXT)
 
 SOURCES = tmac_kernel.cu flash_attention.cu
 OBJECTS = tmac_kernel.o flash_attention.o
@@ -90,6 +91,22 @@ int8: dirs flash_attention_int8.o $(INT8_TARGET)
 all-int8: dirs $(TARGET) $(FA_TARGET) $(INT8_TARGET)
 	@echo "Built all CUDA kernels including INT8 Tensor Core Flash Attention"
 
+# FlashAttention-2 (tiled with online softmax)
+flash_attention_v2.o: flash_attention_v2.cu flash_attention_v2.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(FA2_TARGET): flash_attention_v2.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built FlashAttention-2: $(FA2_TARGET)"
+
+# Build FlashAttention-2
+fa2: dirs flash_attention_v2.o $(FA2_TARGET)
+	@echo "Built FlashAttention-2 (tiled, online softmax)"
+
+# Build all attention variants
+all-attention: dirs $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET)
+	@echo "Built all attention kernels (FP32, INT8, FA2)"
+
 # Test binary
 test: dirs $(OBJECTS)
 	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_cuda_kernel test_cuda_kernel.cu $(OBJECTS) -lcudart
@@ -113,7 +130,7 @@ test-all: test test-flash test-int8
 
 # Clean
 clean:
-	rm -f $(OBJECTS) flash_attention_int8.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET)
+	rm -f $(OBJECTS) flash_attention_int8.o flash_attention_v2.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET) $(FA2_TARGET)
 	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8
 
 # Install to system (optional)
@@ -175,7 +192,9 @@ info:
 	@echo "  make            - Default multi-arch build"
 	@echo "  make flash      - Build with Flash Attention (FP32)"
 	@echo "  make int8       - Build INT8 Tensor Core Flash Attention"
+	@echo "  make fa2        - Build FlashAttention-2 (tiled)"
 	@echo "  make all-int8   - Build all including INT8"
+	@echo "  make all-attention - Build all attention variants"
 	@echo "  make tensorcore - INT8 Tensor Core optimized (sm_75+)"
 	@echo "  make t4         - Tesla T4 optimized (Kaggle/Colab)"
 	@echo "  make a100       - A100 optimized"
