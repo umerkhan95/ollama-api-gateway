@@ -623,7 +623,7 @@ struct CUDAInference:
                  cache_len: Int,
                  head_dim: Int,
                  buffer_seq_len: Int) -> Int:
-        """Execute strided stateless attention with external KV cache.
+        """Execute strided FP32 attention with external KV cache.
 
         Use when KV cache has [n_heads, max_seq_len, head_dim] layout
         but only cache_len positions are valid.
@@ -631,8 +631,8 @@ struct CUDAInference:
         if not self.initialized:
             return -1
 
-        # Use strided version that handles non-contiguous KV cache
-        return Int(self.flash_attn.call["attention_stateless_strided", Int32](
+        # Use pure FP32 strided version (no INT8 quantization issues)
+        return Int(self.flash_attn.call["attention_fp32_strided", Int32](
             q_ptr, k_cache_ptr, v_cache_ptr, o_ptr,
             Int32(n_heads), Int32(cache_len), Int32(head_dim), Int32(buffer_seq_len)))
 

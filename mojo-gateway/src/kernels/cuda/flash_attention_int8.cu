@@ -1353,10 +1353,167 @@ void attention_stateless_cleanup(void) {
     attn_stateless_initialized = 0;
 }
 
-// Forward declaration
+// Forward declarations
 int attention_stateless_strided(
     const float* Q, const float* K_cache, const float* V_cache, float* O,
     int batch_heads, int cache_len, int head_dim, int buffer_seq_len);
+
+/**
+ * Simple FP32 attention kernel (no INT8 quantization)
+ * For debugging and verification.
+ */
+__global__ void attention_fp32_kernel(
+    const float* __restrict__ Q,      // [batch_heads, head_dim]
+    const float* __restrict__ K,      // [batch_heads, cache_len, head_dim]
+    const float* __restrict__ V,      // [batch_heads, cache_len, head_dim]
+    float* __restrict__ O,            // [batch_heads, head_dim]
+    int cache_len,
+    int head_dim,
+    float scale
+) {
+    int bh = blockIdx.x;  // Which head
+    int tid = threadIdx.x;
+
+    // Pointers for this head
+    const float* q = Q + bh * head_dim;
+    const float* k = K + bh * cache_len * head_dim;
+    const float* v = V + bh * cache_len * head_dim;
+    float* o = O + bh * head_dim;
+
+    // Shared memory for scores and output accumulator
+    extern __shared__ float smem[];
+    float* scores = smem;  // [cache_len]
+
+    // Step 1: Compute attention scores Q @ K^T
+    for (int t = tid; t < cache_len; t += blockDim.x) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q[d] * k[t * head_dim + d];
+        }
+        scores[t] = score * scale;
+    }
+    __syncthreads();
+
+    // Step 2: Softmax
+    // Find max (reduction)
+    float max_score = -1e10f;
+    for (int t = tid; t < cache_len; t += blockDim.x) {
+        max_score = fmaxf(max_score, scores[t]);
+    }
+
+    // Block reduction for max
+    __shared__ float s_max[256];
+    s_max[tid] = max_score;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < blockDim.x) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    max_score = s_max[0];
+
+    // Exp and sum
+    float sum_exp = 0.0f;
+    for (int t = tid; t < cache_len; t += blockDim.x) {
+        scores[t] = expf(scores[t] - max_score);
+        sum_exp += scores[t];
+    }
+
+    // Block reduction for sum
+    __shared__ float s_sum[256];
+    s_sum[tid] = sum_exp;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s && tid + s < blockDim.x) {
+            s_sum[tid] += s_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    sum_exp = s_sum[0];
+
+    // Normalize
+    float inv_sum = 1.0f / sum_exp;
+    for (int t = tid; t < cache_len; t += blockDim.x) {
+        scores[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    // Step 3: Output = scores @ V
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < cache_len; t++) {
+            acc += scores[t] * v[t * head_dim + d];
+        }
+        o[d] = acc;
+    }
+}
+
+/**
+ * Pure FP32 stateless attention with strided buffers (for debugging)
+ */
+int attention_fp32_strided(
+    const float* Q,
+    const float* K_cache,
+    const float* V_cache,
+    float* O,
+    int batch_heads,
+    int cache_len,
+    int head_dim,
+    int buffer_seq_len
+) {
+    // Allocate device memory
+    float* d_Q;
+    float* d_K;
+    float* d_V;
+    float* d_O;
+
+    size_t q_size = batch_heads * head_dim * sizeof(float);
+    size_t kv_contiguous_size = batch_heads * cache_len * head_dim * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&d_Q, q_size));
+    CUDA_CHECK(cudaMalloc(&d_K, kv_contiguous_size));
+    CUDA_CHECK(cudaMalloc(&d_V, kv_contiguous_size));
+    CUDA_CHECK(cudaMalloc(&d_O, q_size));
+
+    // Copy Q (always contiguous)
+    CUDA_CHECK(cudaMemcpy(d_Q, Q, q_size, cudaMemcpyHostToDevice));
+
+    // Copy K, V with stride handling
+    for (int h = 0; h < batch_heads; h++) {
+        size_t src_offset = h * buffer_seq_len * head_dim;
+        size_t dst_offset = h * cache_len * head_dim;
+        size_t copy_size = cache_len * head_dim * sizeof(float);
+
+        CUDA_CHECK(cudaMemcpy(d_K + dst_offset, K_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_V + dst_offset, V_cache + src_offset, copy_size, cudaMemcpyHostToDevice));
+    }
+
+    float scale = 1.0f / sqrtf((float)head_dim);
+
+    // Shared memory: scores array
+    size_t smem_size = cache_len * sizeof(float);
+
+    dim3 grid(batch_heads);
+    dim3 block(128);
+
+    attention_fp32_kernel<<<grid, block, smem_size>>>(
+        d_Q, d_K, d_V, d_O,
+        cache_len, head_dim, scale
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy result back
+    CUDA_CHECK(cudaMemcpy(O, d_O, q_size, cudaMemcpyDeviceToHost));
+
+    // Cleanup
+    cudaFree(d_Q);
+    cudaFree(d_K);
+    cudaFree(d_V);
+    cudaFree(d_O);
+
+    return 0;
+}
 
 /**
  * Fast stateless attention with reused buffers

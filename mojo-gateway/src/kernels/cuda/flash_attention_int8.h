@@ -258,6 +258,20 @@ int attention_stateless_fast(
 );
 
 /**
+ * Pure FP32 strided attention (no INT8 quantization) - for debugging
+ */
+int attention_fp32_strided(
+    const float* Q,
+    const float* K_cache,
+    const float* V_cache,
+    float* O,
+    int batch_heads,
+    int cache_len,
+    int head_dim,
+    int buffer_seq_len
+);
+
+/**
  * Strided stateless attention - handles non-contiguous KV cache
  *
  * Use when KV cache has layout [batch_heads, max_seq_len, head_dim]
