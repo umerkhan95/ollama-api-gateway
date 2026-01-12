@@ -267,8 +267,8 @@ __global__ void ffn_fused_small_kernel_f32(
  *
  * Uses INT8 weights with FP32 accumulation for memory efficiency
  * Requires compute capability 6.1+ for __dp4a intrinsic
+ * Note: Build with DP4A_CUDA_ARCH (sm_61+) to ensure __dp4a availability
  */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
 __global__ void swiglu_int8_kernel(
     float* __restrict__ output,
     const float* __restrict__ input,
@@ -316,7 +316,6 @@ __global__ void swiglu_int8_kernel(
 
     output[row * intermediate_dim + col] = silu(gate_val) * up_val;
 }
-#endif // __CUDA_ARCH__ >= 610
 
 // =============================================================================
 // Host wrapper functions
