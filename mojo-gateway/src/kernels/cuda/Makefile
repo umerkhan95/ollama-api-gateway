@@ -36,10 +36,11 @@ BIN_DIR = ../../../bin
 TARGET = $(LIB_DIR)/libtmac_kernel_cuda.$(SHARED_EXT)
 STATIC_TARGET = $(LIB_DIR)/libtmac_kernel_cuda.a
 FA_TARGET = $(LIB_DIR)/libflash_attention.$(SHARED_EXT)
+INT8_TARGET = $(LIB_DIR)/libflash_attention_int8.$(SHARED_EXT)
 
 SOURCES = tmac_kernel.cu flash_attention.cu
 OBJECTS = tmac_kernel.o flash_attention.o
-HEADERS = tmac_kernel_cuda.h flash_attention.h
+HEADERS = tmac_kernel_cuda.h flash_attention.h flash_attention_int8.h
 
 .PHONY: all clean test install dirs check info
 
@@ -73,6 +74,22 @@ $(FA_TARGET): flash_attention.o
 flash: dirs $(TARGET) $(FA_TARGET)
 	@echo "Built all CUDA kernels including Flash Attention"
 
+# INT8 Tensor Core Flash Attention (requires sm_75+)
+flash_attention_int8.o: flash_attention_int8.cu flash_attention_int8.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(INT8_TARGET): flash_attention_int8.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built INT8 Flash Attention: $(INT8_TARGET)"
+
+# Build INT8 Tensor Core kernels
+int8: dirs flash_attention_int8.o $(INT8_TARGET)
+	@echo "Built INT8 Tensor Core Flash Attention"
+
+# Build all including INT8
+all-int8: dirs $(TARGET) $(FA_TARGET) $(INT8_TARGET)
+	@echo "Built all CUDA kernels including INT8 Tensor Core Flash Attention"
+
 # Test binary
 test: dirs $(OBJECTS)
 	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_cuda_kernel test_cuda_kernel.cu $(OBJECTS) -lcudart
@@ -85,13 +102,19 @@ test-flash: dirs flash_attention.o
 	@echo "Running Flash Attention tests..."
 	$(BIN_DIR)/test_flash_attention
 
+# INT8 Flash Attention test
+test-int8: dirs flash_attention_int8.o
+	$(NVCC) $(NVCC_FLAGS) -o $(BIN_DIR)/test_flash_attention_int8 test_flash_attention_int8.cu flash_attention_int8.o -lcudart
+	@echo "Running INT8 Flash Attention tests..."
+	$(BIN_DIR)/test_flash_attention_int8
+
 # Test all
-test-all: test test-flash
+test-all: test test-flash test-int8
 
 # Clean
 clean:
-	rm -f $(OBJECTS) $(TARGET) $(STATIC_TARGET) $(FA_TARGET)
-	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention
+	rm -f $(OBJECTS) flash_attention_int8.o $(TARGET) $(STATIC_TARGET) $(FA_TARGET) $(INT8_TARGET)
+	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8
 
 # Install to system (optional)
 install: $(TARGET)
@@ -145,11 +168,14 @@ info:
 	@nvcc --version 2>/dev/null || echo "CUDA not available"
 	@echo "Target: $(TARGET)"
 	@echo "Flash Attention: $(FA_TARGET)"
+	@echo "INT8 Flash Attention: $(INT8_TARGET)"
 	@echo "CUDA_ARCH: $(CUDA_ARCH)"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  make            - Default multi-arch build"
-	@echo "  make flash      - Build with Flash Attention"
+	@echo "  make flash      - Build with Flash Attention (FP32)"
+	@echo "  make int8       - Build INT8 Tensor Core Flash Attention"
+	@echo "  make all-int8   - Build all including INT8"
 	@echo "  make tensorcore - INT8 Tensor Core optimized (sm_75+)"
 	@echo "  make t4         - Tesla T4 optimized (Kaggle/Colab)"
 	@echo "  make a100       - A100 optimized"
@@ -159,5 +185,6 @@ info:
 	@echo ""
 	@echo "Test targets:"
 	@echo "  make test       - Run T-MAC kernel tests"
-	@echo "  make test-flash - Run Flash Attention tests"
+	@echo "  make test-flash - Run Flash Attention tests (FP32)"
+	@echo "  make test-int8  - Run INT8 Flash Attention tests"
 	@echo "  make test-all   - Run all tests"
