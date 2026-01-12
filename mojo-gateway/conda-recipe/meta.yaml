@@ -32,7 +32,7 @@ test:
     - edgellm --help
 
 about:
-  home: https://github.com/umerkhan95/ollama-api-gateway
+  home: https://github.com/umerkhan95/EdgeLLM
   license: MIT
   license_family: MIT
   summary: High-performance LLM inference for edge devices with deterministic latency
@@ -47,7 +47,7 @@ about:
     - 15.5x lower latency jitter than Ollama
     - 2.5x faster attention on GPU (INT8 dp4a)
     - Runs on $15 Raspberry Pi Zero
-  dev_url: https://github.com/umerkhan95/ollama-api-gateway
+  dev_url: https://github.com/umerkhan95/EdgeLLM
 
 extra:
   recipe-maintainers:

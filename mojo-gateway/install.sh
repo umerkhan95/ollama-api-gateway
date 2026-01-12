@@ -15,7 +15,7 @@ NC='\033[0m' # No Color
 EDGELLM_VERSION="${EDGELLM_VERSION:-latest}"
 INSTALL_DIR="${EDGELLM_HOME:-$HOME/.edgellm}"
 BIN_DIR="${EDGELLM_BIN:-$HOME/.local/bin}"
-REPO_URL="https://github.com/umerkhan95/ollama-api-gateway.git"
+REPO_URL="https://github.com/umerkhan95/EdgeLLM.git"
 
 echo -e "${BLUE}"
 echo "  _____ ____   ____ _____   _     _     __  __ "

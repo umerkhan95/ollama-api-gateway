@@ -3,7 +3,7 @@
 ## Quick Install (One-Liner)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/umerkhan95/ollama-api-gateway/main/mojo-gateway/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/umerkhan95/EdgeLLM/main/mojo-gateway/install.sh | bash
 ```
 
 ## Install via Pixi/Magic
@@ -38,7 +38,7 @@ pixi run edgellm --help
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/umerkhan95/ollama-api-gateway.git
+git clone https://github.com/umerkhan95/EdgeLLM.git
 cd ollama-api-gateway/mojo-gateway
 
 # 2. Install dependencies
@@ -93,7 +93,7 @@ edgellm serve smollm-135m --port 8080
 
 ```bash
 # Using install script
-curl -fsSL https://raw.githubusercontent.com/umerkhan95/ollama-api-gateway/main/mojo-gateway/install.sh | bash -s uninstall
+curl -fsSL https://raw.githubusercontent.com/umerkhan95/EdgeLLM/main/mojo-gateway/install.sh | bash -s uninstall
 
 # Or manually
 rm -rf ~/.edgellm

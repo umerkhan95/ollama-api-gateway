@@ -31,7 +31,7 @@ tests:
       - edgellm --help
 
 about:
-  homepage: https://github.com/umerkhan95/ollama-api-gateway
+  homepage: https://github.com/umerkhan95/EdgeLLM
   license: MIT
   summary: High-performance LLM inference for edge devices
   description: |
@@ -43,8 +43,8 @@ about:
     - 15.5x lower jitter than Ollama
     - 2.5x faster GPU attention (INT8)
     - Multi-tenant API gateway
-  repository: https://github.com/umerkhan95/ollama-api-gateway
-  documentation: https://github.com/umerkhan95/ollama-api-gateway/blob/main/README.md
+  repository: https://github.com/umerkhan95/EdgeLLM
+  documentation: https://github.com/umerkhan95/EdgeLLM/blob/main/README.md
 
 extra:
   maintainers:
