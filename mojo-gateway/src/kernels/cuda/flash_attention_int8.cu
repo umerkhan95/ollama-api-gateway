@@ -1353,6 +1353,11 @@ void attention_stateless_cleanup(void) {
     attn_stateless_initialized = 0;
 }
 
+// Forward declaration
+int attention_stateless_strided(
+    const float* Q, const float* K_cache, const float* V_cache, float* O,
+    int batch_heads, int cache_len, int head_dim, int buffer_seq_len);
+
 /**
  * Fast stateless attention with reused buffers
  * NOTE: Expects contiguous [batch_heads, cache_len, head_dim] layout
