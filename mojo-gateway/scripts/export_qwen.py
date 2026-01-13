@@ -49,10 +49,17 @@ def export_qwen(model_id: str, output_path: str):
     # Prepare output file
     print(f"\nExporting to: {output_path}")
 
+    import numpy as np
+
+    kv_dim = n_kv_heads * head_size
+    # Limit seq_len for RoPE precomputation (Qwen has 131072 which is too large)
+    rope_seq_len = min(seq_len, 8192)
+
     with open(output_path, 'wb') as f:
         # Write header (7 int32 values)
         # Format: dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len
-        header = struct.pack('iiiiiii', dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len)
+        # Use limited seq_len for RoPE
+        header = struct.pack('iiiiiii', dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, rope_seq_len)
         f.write(header)
 
         state_dict = model.state_dict()
@@ -63,65 +70,79 @@ def export_qwen(model_id: str, output_path: str):
             f.write(data.tobytes())
             print(f"  {name}: {tensor.shape} -> {data.nbytes / 1024 / 1024:.2f} MB")
 
-        # Token embeddings [vocab_size, dim]
-        print("\nWriting embeddings...")
-        write_tensor(state_dict['model.embed_tokens.weight'], 'embed_tokens')
+        # =====================================================================
+        # Weight order must match Mojo inference code expectations:
+        # All weights for each type are stacked into a single tensor
+        # =====================================================================
 
-        # RMS norm weights for attention
-        print("\nWriting attention norms...")
-        for i in range(n_layers):
-            write_tensor(state_dict[f'model.layers.{i}.input_layernorm.weight'], f'layer{i}.attn_norm')
+        # 1. Token embeddings [vocab_size, dim]
+        print("\nWriting token_embedding...")
+        write_tensor(state_dict['model.embed_tokens.weight'], 'token_embedding')
 
-        # Attention weights
-        print("\nWriting attention weights...")
-        for i in range(n_layers):
-            # Q projection [dim, dim]
-            wq = state_dict[f'model.layers.{i}.self_attn.q_proj.weight']
-            write_tensor(wq, f'layer{i}.wq')
+        # 2. rms_att_weight [n_layers, dim] - stacked into single tensor
+        print("\nWriting rms_att_weight [n_layers, dim]...")
+        rms_att = torch.stack([state_dict[f'model.layers.{i}.input_layernorm.weight'] for i in range(n_layers)])
+        write_tensor(rms_att, 'rms_att_weight')
 
-            # K projection [dim, kv_dim]
-            wk = state_dict[f'model.layers.{i}.self_attn.k_proj.weight']
-            write_tensor(wk, f'layer{i}.wk')
+        # 3. wq [n_layers, dim, dim] - stacked
+        print("\nWriting wq [n_layers, dim, dim]...")
+        wq = torch.stack([state_dict[f'model.layers.{i}.self_attn.q_proj.weight'] for i in range(n_layers)])
+        write_tensor(wq, 'wq')
 
-            # V projection [dim, kv_dim]
-            wv = state_dict[f'model.layers.{i}.self_attn.v_proj.weight']
-            write_tensor(wv, f'layer{i}.wv')
+        # 4. wk [n_layers, kv_dim, dim] - stacked
+        print("\nWriting wk [n_layers, kv_dim, dim]...")
+        wk = torch.stack([state_dict[f'model.layers.{i}.self_attn.k_proj.weight'] for i in range(n_layers)])
+        write_tensor(wk, 'wk')
 
-            # Output projection [dim, dim]
-            wo = state_dict[f'model.layers.{i}.self_attn.o_proj.weight']
-            write_tensor(wo, f'layer{i}.wo')
+        # 5. wv [n_layers, kv_dim, dim] - stacked
+        print("\nWriting wv [n_layers, kv_dim, dim]...")
+        wv = torch.stack([state_dict[f'model.layers.{i}.self_attn.v_proj.weight'] for i in range(n_layers)])
+        write_tensor(wv, 'wv')
 
-        # RMS norm weights for FFN
-        print("\nWriting FFN norms...")
-        for i in range(n_layers):
-            write_tensor(state_dict[f'model.layers.{i}.post_attention_layernorm.weight'], f'layer{i}.ffn_norm')
+        # 6. wo [n_layers, dim, dim] - stacked
+        print("\nWriting wo [n_layers, dim, dim]...")
+        wo = torch.stack([state_dict[f'model.layers.{i}.self_attn.o_proj.weight'] for i in range(n_layers)])
+        write_tensor(wo, 'wo')
 
-        # FFN weights (Qwen uses SwiGLU: gate_proj, up_proj, down_proj)
-        print("\nWriting FFN weights...")
-        for i in range(n_layers):
-            # Gate projection (w1) [hidden_dim, dim]
-            w1 = state_dict[f'model.layers.{i}.mlp.gate_proj.weight']
-            write_tensor(w1, f'layer{i}.w1')
+        # 7. rms_ffn_weight [n_layers, dim] - stacked
+        print("\nWriting rms_ffn_weight [n_layers, dim]...")
+        rms_ffn = torch.stack([state_dict[f'model.layers.{i}.post_attention_layernorm.weight'] for i in range(n_layers)])
+        write_tensor(rms_ffn, 'rms_ffn_weight')
 
-            # Down projection (w2) [dim, hidden_dim]
-            w2 = state_dict[f'model.layers.{i}.mlp.down_proj.weight']
-            write_tensor(w2, f'layer{i}.w2')
+        # 8. w1 (gate_proj) [n_layers, hidden_dim, dim] - stacked
+        print("\nWriting w1 [n_layers, hidden_dim, dim]...")
+        w1 = torch.stack([state_dict[f'model.layers.{i}.mlp.gate_proj.weight'] for i in range(n_layers)])
+        write_tensor(w1, 'w1')
 
-            # Up projection (w3) [hidden_dim, dim]
-            w3 = state_dict[f'model.layers.{i}.mlp.up_proj.weight']
-            write_tensor(w3, f'layer{i}.w3')
+        # 9. w2 (down_proj) [n_layers, dim, hidden_dim] - stacked
+        print("\nWriting w2 [n_layers, dim, hidden_dim]...")
+        w2 = torch.stack([state_dict[f'model.layers.{i}.mlp.down_proj.weight'] for i in range(n_layers)])
+        write_tensor(w2, 'w2')
 
-        # Final norm
-        print("\nWriting final norm...")
-        write_tensor(state_dict['model.norm.weight'], 'final_norm')
+        # 10. w3 (up_proj) [n_layers, hidden_dim, dim] - stacked
+        print("\nWriting w3 [n_layers, hidden_dim, dim]...")
+        w3 = torch.stack([state_dict[f'model.layers.{i}.mlp.up_proj.weight'] for i in range(n_layers)])
+        write_tensor(w3, 'w3')
 
-        # Output weights (lm_head) - may be tied to embeddings
-        print("\nWriting output weights...")
-        if 'lm_head.weight' in state_dict:
-            write_tensor(state_dict['lm_head.weight'], 'lm_head')
-        else:
-            # Tied weights - write embeddings again
-            write_tensor(state_dict['model.embed_tokens.weight'], 'lm_head (tied)')
+        # 11. Final RMS norm [dim]
+        print("\nWriting rms_final_weight...")
+        write_tensor(state_dict['model.norm.weight'], 'rms_final')
+
+        # 12 & 13. Precompute RoPE frequencies (freq_cis_real, freq_cis_imag)
+        print("\nComputing freq_cis (RoPE)...")
+        inv_freq = 1.0 / (10000.0 ** (np.arange(0, head_size, 2, dtype=np.float32) / head_size))
+        t = np.arange(rope_seq_len, dtype=np.float32)
+        freqs = np.outer(t, inv_freq)
+        freq_cis_real = np.cos(freqs).astype(np.float32)
+        freq_cis_imag = np.sin(freqs).astype(np.float32)
+
+        f.write(freq_cis_real.tobytes())
+        print(f"  freq_cis_real: {freq_cis_real.shape} -> {freq_cis_real.nbytes / 1024 / 1024:.2f} MB")
+        f.write(freq_cis_imag.tobytes())
+        print(f"  freq_cis_imag: {freq_cis_imag.shape} -> {freq_cis_imag.nbytes / 1024 / 1024:.2f} MB")
+
+        # Note: wcls (output projection) is skipped if weights are shared with embeddings
+        # The Mojo code handles this with shared_weights flag
 
     file_size = os.path.getsize(output_path)
     print(f"\nDone! Output size: {file_size / 1024 / 1024:.2f} MB")
