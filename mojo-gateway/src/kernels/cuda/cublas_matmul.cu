@@ -15,6 +15,10 @@ extern "C" int int4_init(cudaStream_t stream);
 extern "C" int int4_gemv(float* out, const float* x, const unsigned char* W, const half* scales, int out_dim, int in_dim);
 extern "C" void int4_sync();
 
+// Forward declarations (for internal use - must be extern "C" for compatibility)
+extern "C" int cublas_init_int4_sizes(size_t fp32_bytes, size_t int4_weights_bytes, size_t int4_scales_bytes, size_t activation_bytes);
+extern "C" int gpu_configure_int4(int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads, int vocab_size, int seq_len, int head_dim, int kv_dim, int group_size);
+
 // Global cuBLAS handle - reuse across calls
 static cublasHandle_t g_cublas_handle = nullptr;
 static cudaStream_t g_stream = nullptr;
@@ -554,6 +558,11 @@ void cublas_cleanup() {
 float* get_weights_gpu() { return g_weights_gpu; }
 float* get_activations_gpu() { return g_act_gpu; }
 
+// EAGLE-specific getters (for speculative decoding integration)
+cublasHandle_t get_cublas_handle() { return g_cublas_handle; }
+cudaStream_t get_cuda_stream() { return g_stream; }
+// Note: INT4 getters are defined after INT4 variables (see get_int4_weights_gpu, get_int4_scales_gpu)
+
 /**
  * CUDA memory operations (wrappers for FFI).
  */
@@ -620,6 +629,29 @@ static size_t g_logits_offset = 0;
 static size_t g_k_cache_offset = 0;
 static size_t g_v_cache_offset = 0;
 static size_t g_result_offset = 0;
+
+// EAGLE config and offset getters
+int get_model_dim() { return g_dim; }
+int get_model_hidden_dim() { return g_hidden_dim; }
+int get_model_n_layers() { return g_n_layers; }
+int get_model_n_heads() { return g_n_heads; }
+int get_model_n_kv_heads() { return g_n_kv_heads; }
+int get_model_vocab_size() { return g_vocab_size; }
+int get_model_seq_len() { return g_seq_len; }
+int get_model_head_dim() { return g_head_dim; }
+int get_model_kv_dim() { return g_kv_dim; }
+
+size_t get_x_offset() { return g_x_offset; }
+size_t get_xb_offset() { return g_xb_offset; }
+size_t get_xb2_offset() { return g_xb2_offset; }
+size_t get_logits_offset() { return g_logits_offset; }
+size_t get_k_cache_offset() { return g_k_cache_offset; }
+size_t get_v_cache_offset() { return g_v_cache_offset; }
+size_t get_rms_final_offset() { return g_rms_final_offset; }
+
+// Sampling integration getters (returns direct GPU pointers)
+float* get_logits_gpu() { return g_act_gpu + g_logits_offset; }
+int get_vocab_size() { return g_vocab_size; }
 
 /**
  * Configure model dimensions. Call once after loading model.
@@ -721,15 +753,6 @@ int gpu_forward(int token, int pos) {
     float* emb = w + g_token_emb_offset + token * d;
     cudaMemcpyAsync(x, emb, d * sizeof(float), cudaMemcpyDeviceToDevice, g_stream);
 
-    // Debug: Check first embedding values
-    if (pos == 0) {
-        cudaStreamSynchronize(g_stream);
-        float emb_check[4];
-        cudaMemcpy(emb_check, x, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-        printf("x[0..3] after emb lookup: %.4f, %.4f, %.4f, %.4f\n",
-               emb_check[0], emb_check[1], emb_check[2], emb_check[3]);
-    }
-
     // Forward through layers
     for (int layer = 0; layer < g_n_layers; layer++) {
         // Weight pointers for this layer
@@ -804,21 +827,6 @@ int gpu_forward(int token, int pos) {
     float* token_emb = w + g_token_emb_offset;
     cublas_matvec(logits, xb, token_emb, g_vocab_size, d);
 
-    // Debug: Check logits before argmax
-    if (pos < 3 || (pos >= 15 && pos < 20)) {
-        cudaStreamSynchronize(g_stream);
-        float logit_check[5];
-        cudaMemcpy(logit_check, logits, 5 * sizeof(float), cudaMemcpyDeviceToHost);
-
-        // Also check x state
-        float x_check[4];
-        cudaMemcpy(x_check, x, 4 * sizeof(float), cudaMemcpyDeviceToHost);
-
-        printf("pos=%d x[0..3]: %.4f, %.4f, %.4f, %.4f  logits[0..4]: %.4f, %.4f, %.4f, %.4f, %.4f\n",
-               pos, x_check[0], x_check[1], x_check[2], x_check[3],
-               logit_check[0], logit_check[1], logit_check[2], logit_check[3], logit_check[4]);
-    }
-
     // Argmax
     argmax_kernel<<<1, 256, 0, g_stream>>>(result, logits, g_vocab_size);
 
@@ -864,6 +872,10 @@ static size_t g_int4_w2_scales_offset = 0;
 static size_t g_int4_w2_packed_offset = 0;
 static size_t g_int4_w3_scales_offset = 0;
 static size_t g_int4_w3_packed_offset = 0;
+
+// INT4 getters (defined after variables to avoid forward reference)
+uint8_t* get_int4_weights_gpu() { return g_int4_weights_gpu; }
+half* get_int4_scales_gpu() { return g_int4_scales_gpu; }
 
 /**
  * Calculate INT4 model buffer sizes for allocation.
@@ -927,12 +939,85 @@ void int4_calculate_sizes(
                          w1_scales + w2_scales + w3_scales;
 }
 
+// Temporary storage for FP32 weights (for old API compatibility)
+static float* g_temp_fp32_weights = nullptr;
+static size_t g_temp_fp32_size = 0;
+
 /**
- * Initialize INT4 inference mode.
+ * Initialize INT4 inference mode (OLD API for compatibility).
+ * Takes model config parameters and FP32 weights pointer.
+ *
+ * NOTE: This wrapper now calculates the actual FP32 buffer size based on what
+ * is typically in model files (embeddings + rms norms), not the full size
+ * including freq_cos/sin and biases which are often computed at runtime.
+ */
+int cublas_init_int4(
+    float* fp32_weights, int dim, int hidden_dim, int n_layers,
+    int n_heads, int n_kv_heads, int vocab_size, int seq_len,
+    int head_dim, int kv_dim
+) {
+    // Calculate the ACTUAL fp32 buffer size based on model file format (export_qwen_int4.py):
+    // This MUST match what's stored in the model file
+    size_t actual_fp32_elements = (size_t)vocab_size * dim;  // embeddings
+    actual_fp32_elements += (size_t)n_layers * dim;          // rms_att (stacked)
+    actual_fp32_elements += (size_t)n_layers * dim;          // rms_ffn (stacked)
+    actual_fp32_elements += (size_t)dim;                     // rms_final
+    actual_fp32_elements += (size_t)seq_len * (head_dim / 2);  // freq_cos
+    actual_fp32_elements += (size_t)seq_len * (head_dim / 2);  // freq_sin
+    actual_fp32_elements += (size_t)n_layers * dim;          // bq (QKV biases)
+    actual_fp32_elements += (size_t)n_layers * kv_dim;       // bk
+    actual_fp32_elements += (size_t)n_layers * kv_dim;       // bv
+    size_t actual_fp32_bytes = actual_fp32_elements * sizeof(float);
+
+    // Calculate INT4 weights and scales sizes using the helper
+    size_t fp32_bytes_calculated, int4_weights_bytes, int4_scales_bytes;
+    int4_calculate_sizes(dim, hidden_dim, n_layers, n_heads, n_kv_heads,
+                         vocab_size, seq_len,
+                         &fp32_bytes_calculated, &int4_weights_bytes, &int4_scales_bytes);
+
+    // Use the larger size for allocation (includes freq/biases for runtime computation)
+    // but only upload what's actually in the buffer
+    size_t fp32_alloc_bytes = fp32_bytes_calculated;
+
+    // Calculate activation size
+    size_t activation_bytes = 0;
+    activation_bytes += (size_t)dim * sizeof(float);           // x
+    activation_bytes += (size_t)dim * sizeof(float);           // xb
+    activation_bytes += (size_t)dim * sizeof(float);           // xb2
+    activation_bytes += (size_t)dim * sizeof(float);           // q
+    activation_bytes += (size_t)kv_dim * sizeof(float);        // k
+    activation_bytes += (size_t)kv_dim * sizeof(float);        // v
+    activation_bytes += (size_t)hidden_dim * sizeof(float);    // hb
+    activation_bytes += (size_t)hidden_dim * sizeof(float);    // hb2
+    activation_bytes += (size_t)vocab_size * sizeof(float);    // logits
+    activation_bytes += (size_t)n_layers * seq_len * kv_dim * sizeof(float); // k_cache
+    activation_bytes += (size_t)n_layers * seq_len * kv_dim * sizeof(float); // v_cache
+    activation_bytes += sizeof(int);                            // result
+
+    printf("FP32 buffer: allocating %.2f MB, uploading %.2f MB\n",
+           fp32_alloc_bytes / 1e6, actual_fp32_bytes / 1e6);
+
+    // Call new init function with allocation size
+    int ret = cublas_init_int4_sizes(fp32_alloc_bytes, int4_weights_bytes, int4_scales_bytes, activation_bytes);
+    if (ret != 0) return ret;
+
+    // Upload only the actual FP32 weights from the buffer (not the padded size)
+    cudaError_t err = cudaMemcpy(g_weights_gpu, fp32_weights, actual_fp32_bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("FP32 upload failed: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+    printf("Uploaded %.2f MB FP32 weights to GPU\n", actual_fp32_bytes / 1e6);
+
+    return 0;
+}
+
+/**
+ * Initialize INT4 inference mode (new API with explicit sizes).
  * Allocates separate buffers for INT4 packed weights and scales.
  */
-int cublas_init_int4(size_t fp32_bytes, size_t int4_weights_bytes, size_t int4_scales_bytes,
-                     size_t activation_bytes) {
+int cublas_init_int4_sizes(size_t fp32_bytes, size_t int4_weights_bytes, size_t int4_scales_bytes,
+                           size_t activation_bytes) {
     // Initialize standard cuBLAS first
     cublasStatus_t status = cublasCreate(&g_cublas_handle);
     if (status != CUBLAS_STATUS_SUCCESS) {
@@ -979,31 +1064,16 @@ int cublas_init_int4(size_t fp32_bytes, size_t int4_weights_bytes, size_t int4_s
 }
 
 /**
- * Upload INT4 weights to GPU.
- *
- * @param fp32_data FP32 weights (embeddings, norms, biases)
- * @param fp32_bytes Size of FP32 data
- * @param int4_packed Packed INT4 weights
- * @param int4_packed_bytes Size of packed weights
- * @param int4_scales FP16 scales
- * @param int4_scales_bytes Size of scales
+ * Upload INT4 weights to GPU (OLD API for compatibility).
+ * FP32 weights are already uploaded by cublas_init_int4.
  */
 int cublas_upload_int4_weights(
-    const float* fp32_data, size_t fp32_bytes,
-    const uint8_t* int4_packed, size_t int4_packed_bytes,
-    const half* int4_scales, size_t int4_scales_bytes
+    const uint8_t* int4_packed,
+    const half* int4_scales,
+    size_t int4_packed_bytes,
+    size_t int4_scales_bytes
 ) {
     cudaError_t err;
-
-    // Upload FP32 data
-    if (fp32_data && fp32_bytes > 0) {
-        err = cudaMemcpy(g_weights_gpu, fp32_data, fp32_bytes, cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            printf("FP32 upload failed: %s\n", cudaGetErrorString(err));
-            return -1;
-        }
-        printf("Uploaded %.2f MB FP32 weights to GPU\n", fp32_bytes / 1e6);
-    }
 
     // Upload INT4 packed weights
     if (int4_packed && int4_packed_bytes > 0) {
@@ -1031,8 +1101,10 @@ int cublas_upload_int4_weights(
 /**
  * Configure INT4 model dimensions and calculate weight offsets.
  */
-int gpu_configure_int4(int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads,
-                       int vocab_size, int seq_len, int has_bias) {
+
+// Internal implementation of gpu_configure_int4 with has_bias parameter
+static int gpu_configure_int4_internal(int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads,
+                                       int vocab_size, int seq_len, int has_bias) {
     // Set basic dimensions (reuse FP32 config)
     g_dim = dim;
     g_hidden_dim = hidden_dim;
@@ -1117,6 +1189,30 @@ int gpu_configure_int4(int dim, int hidden_dim, int n_layers, int n_heads, int n
     printf("  INT4 group size: %d, n_groups(dim): %d, n_groups(hd): %d\n",
            group_size, n_groups_dim, n_groups_hd);
     return 0;
+}
+
+/**
+ * Public API: Configure INT4 mode with 10 arguments (edgellm_eagle.cu compatibility).
+ * head_dim and kv_dim are ignored (calculated internally).
+ */
+int gpu_configure_int4(int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads,
+                       int vocab_size, int seq_len, int head_dim, int kv_dim, int group_size) {
+    (void)head_dim;  // Unused - calculated internally
+    (void)kv_dim;    // Unused - calculated internally
+    (void)group_size; // Unused - uses INT4_GROUP_SIZE constant
+    // Qwen models have QKV biases - must enable bias mode
+    return gpu_configure_int4_internal(dim, hidden_dim, n_layers, n_heads, n_kv_heads,
+                                       vocab_size, seq_len, 1);  // 1 = has bias
+}
+
+/**
+ * Alternative API: Configure INT4 mode with has_bias parameter.
+ * For code that needs to specify bias usage explicitly.
+ */
+void cublas_configure_int4(int dim, int hidden_dim, int n_layers, int n_heads, int n_kv_heads,
+                           int vocab_size, int seq_len, int has_bias) {
+    gpu_configure_int4_internal(dim, hidden_dim, n_layers, n_heads, n_kv_heads,
+                                vocab_size, seq_len, has_bias);
 }
 
 /**
@@ -1294,6 +1390,7 @@ int gpu_forward_int4(int token, int pos) {
         cublas_matvec(logits, xb, token_emb, g_vocab_size, d);
     }
 
+    // Debug: check logits for first calls
     // Argmax
     argmax_kernel<<<1, 256, 0, g_stream>>>(result, logits, g_vocab_size);
 

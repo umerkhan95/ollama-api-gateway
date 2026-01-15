@@ -307,6 +307,192 @@ cublas: dirs cublas_matmul.o $(CUBLAS_TARGET)
 	@echo "Built cuBLAS full GPU inference kernel (400+ tok/s target)"
 
 # =============================================================================
+# EAGLE Speculative Decoding (Tree Attention)
+# =============================================================================
+# Tree attention kernel for parallel verification of draft tokens
+# Based on: https://arxiv.org/abs/2401.15077 (EAGLE)
+
+TREE_ATTENTION_TARGET = $(LIB_DIR)/libtree_attention.$(SHARED_EXT)
+
+tree_attention.o: tree_attention.cu tree_attention.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(TREE_ATTENTION_TARGET): tree_attention.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Tree Attention kernel: $(TREE_ATTENTION_TARGET)"
+
+# Build tree attention for speculative decoding
+tree-attention: dirs tree_attention.o $(TREE_ATTENTION_TARGET)
+	@echo "Built Tree Attention kernel (EAGLE speculative decoding)"
+
+# =============================================================================
+# EAGLE Speculative Decoding Full System
+# =============================================================================
+# Complete EAGLE implementation with:
+# - eagle_inference.cu: Draft model forward, verification, generation loop
+# - eagle_weights_init.cu: Weight initialization (random, identity-like, load/save)
+# - edgellm_eagle.cu: Main test binary
+
+EAGLE_TARGET = $(LIB_DIR)/libeagle_inference.$(SHARED_EXT)
+EAGLE_BIN = $(BIN_DIR)/edgellm_eagle
+
+eagle_inference.o: eagle_inference.cu
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@ -lcublas -lcurand
+
+eagle_weights_init.o: eagle_weights_init.cu eagle_weights_init.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@ -lcurand
+
+$(EAGLE_TARGET): eagle_inference.o eagle_weights_init.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart -lcublas -lcurand
+	@echo "Built EAGLE inference library: $(EAGLE_TARGET)"
+
+# EAGLE test binary (requires cublas_matmul.o for INT4 inference)
+edgellm_eagle.o: edgellm_eagle.cu eagle_weights_init.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(EAGLE_BIN): edgellm_eagle.o cublas_matmul.o eagle_inference.o eagle_weights_init.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ -lcudart -lcublas -lcurand
+	@echo "Built EAGLE test binary: $(EAGLE_BIN)"
+
+# Build EAGLE library
+eagle-lib: dirs eagle_inference.o eagle_weights_init.o $(EAGLE_TARGET)
+	@echo "Built EAGLE speculative decoding library"
+
+# Build EAGLE test binary (RECOMMENDED for testing)
+eagle: dirs cublas_matmul.o eagle_inference.o eagle_weights_init.o edgellm_eagle.o $(EAGLE_BIN)
+	@echo "Built EAGLE speculative decoding test binary"
+	@echo "Usage: $(EAGLE_BIN) -i 'prompt' -n 100 -d 6 --baseline"
+
+# Build full EdgeLLM 2.0 (INT4 + EAGLE + Temperature Sampling)
+edgellm2: dirs cublas_matmul.o eagle_inference.o eagle_weights_init.o edgellm_eagle.o $(EAGLE_BIN)
+	@echo "Built EdgeLLM 2.0 with EAGLE speculative decoding"
+
+# =============================================================================
+# edge CLI - Minimal Ollama-style interface
+# =============================================================================
+# Usage: edge run qwen -p "What is 2+2?"
+
+EDGE_BIN = $(BIN_DIR)/edge
+
+edge_cli.o: edge_cli.cu
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+sampling.o: sampling.cu sampling.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@ -lcurand
+
+inference_with_sampling.o: inference_with_sampling.cu
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@ -lcurand
+
+$(EDGE_BIN): edge_cli.o cublas_matmul.o sampling.o inference_with_sampling.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ -lcudart -lcublas -lcurand
+	@echo ""
+	@echo "Built: $(EDGE_BIN)"
+	@echo ""
+	@echo "Usage:"
+	@echo "  edge run qwen              Interactive chat"
+	@echo "  edge run qwen -p 'prompt'  Single generation"
+	@echo "  edge models                List models"
+	@echo ""
+
+# Build edge CLI (RECOMMENDED for users)
+edge: dirs cublas_matmul.o sampling.o inference_with_sampling.o edge_cli.o $(EDGE_BIN)
+	@echo "Built edge CLI"
+
+# =============================================================================
+# Lookahead Decoding (Training-Free Speculative Decoding)
+# =============================================================================
+# Based on: https://arxiv.org/abs/2402.02057 (ICML 2024)
+# Uses Jacobi iteration for parallel token prediction without draft model training
+
+LOOKAHEAD_NGRAM_TARGET = $(LIB_DIR)/liblookahead_ngram.$(SHARED_EXT)
+LOOKAHEAD_STATE_TARGET = $(LIB_DIR)/liblookahead_state.$(SHARED_EXT)
+LOOKAHEAD_TARGET = $(LIB_DIR)/liblookahead.$(SHARED_EXT)
+LOOKAHEAD_TEST_BIN = $(BIN_DIR)/test_lookahead
+
+# N-gram pool for candidate caching
+lookahead_ngram.o: lookahead_ngram.cu lookahead_ngram.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(LOOKAHEAD_NGRAM_TARGET): lookahead_ngram.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Lookahead N-gram pool: $(LOOKAHEAD_NGRAM_TARGET)"
+
+# Lookahead state management
+lookahead_state.o: lookahead_state.cu lookahead_state.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(LOOKAHEAD_STATE_TARGET): lookahead_state.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Lookahead state: $(LOOKAHEAD_STATE_TARGET)"
+
+# Combined lookahead library
+$(LOOKAHEAD_TARGET): lookahead_ngram.o lookahead_state.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Lookahead decoding library: $(LOOKAHEAD_TARGET)"
+
+# Build N-gram pool standalone
+lookahead-ngram: dirs lookahead_ngram.o $(LOOKAHEAD_NGRAM_TARGET)
+	@echo "Built Lookahead N-gram pool"
+
+# Build state management standalone
+lookahead-state: dirs lookahead_state.o $(LOOKAHEAD_STATE_TARGET)
+	@echo "Built Lookahead state management"
+
+# Build combined lookahead library (RECOMMENDED)
+lookahead: dirs lookahead_ngram.o lookahead_state.o $(LOOKAHEAD_TARGET)
+	@echo "Built Lookahead decoding library"
+
+# Test binary for Phase 1 structures
+$(LOOKAHEAD_TEST_BIN): test_lookahead.cu lookahead_ngram.o lookahead_state.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Lookahead test binary: $(LOOKAHEAD_TEST_BIN)"
+
+# Run Lookahead tests
+test-lookahead: dirs lookahead_ngram.o lookahead_state.o $(LOOKAHEAD_TEST_BIN)
+	@echo "Running Lookahead decoding tests..."
+	$(LOOKAHEAD_TEST_BIN)
+
+# Lookahead Attention (Phase 2)
+LOOKAHEAD_ATTN_TARGET = $(LIB_DIR)/liblookahead_attention.$(SHARED_EXT)
+LOOKAHEAD_ATTN_TEST_BIN = $(BIN_DIR)/test_lookahead_attention
+
+lookahead_attention.o: lookahead_attention.cu lookahead_attention.h
+	$(NVCC) $(NVCC_FLAGS) -c $< -o $@
+
+$(LOOKAHEAD_ATTN_TARGET): lookahead_attention.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Lookahead attention: $(LOOKAHEAD_ATTN_TARGET)"
+
+# Build lookahead attention library
+lookahead-attention: dirs lookahead_attention.o $(LOOKAHEAD_ATTN_TARGET)
+	@echo "Built Lookahead attention kernel"
+
+# Test binary for lookahead attention
+$(LOOKAHEAD_ATTN_TEST_BIN): test_lookahead_attention.cu lookahead_attention.o
+	$(NVCC) $(NVCC_FLAGS) -o $@ $^ -lcudart
+	@echo "Built Lookahead attention test: $(LOOKAHEAD_ATTN_TEST_BIN)"
+
+# Run lookahead attention tests
+test-lookahead-attention: dirs lookahead_attention.o $(LOOKAHEAD_ATTN_TEST_BIN)
+	@echo "Running Lookahead attention tests..."
+	$(LOOKAHEAD_ATTN_TEST_BIN)
+
+# Combined Lookahead library (Phase 1 + Phase 2)
+LOOKAHEAD_FULL_TARGET = $(LIB_DIR)/liblookahead_full.$(SHARED_EXT)
+
+$(LOOKAHEAD_FULL_TARGET): lookahead_ngram.o lookahead_state.o lookahead_attention.o
+	$(NVCC) $(SHARED_FLAGS) -o $@ $^ -lcudart
+	@echo "Built full Lookahead library: $(LOOKAHEAD_FULL_TARGET)"
+
+# Build complete lookahead system (RECOMMENDED)
+lookahead-full: dirs lookahead_ngram.o lookahead_state.o lookahead_attention.o $(LOOKAHEAD_FULL_TARGET)
+	@echo "Built complete Lookahead decoding system (Phase 1 + 2)"
+
+# Run all lookahead tests
+test-lookahead-all: test-lookahead test-lookahead-attention
+	@echo "All Lookahead tests completed"
+
+# =============================================================================
 # INT4 Quantized Inference (Target: 400+ tok/s)
 # =============================================================================
 # INT4 dequant + GEMV kernel for 8x memory bandwidth reduction
@@ -390,7 +576,11 @@ clean:
 	rm -f rmsnorm_kernel.o ffn_kernel.o embeddings_kernel.o sampling_kernel.o linear_projection.o residual_add.o inference_pipeline.o
 	rm -f $(RMSNORM_TARGET) $(FFN_TARGET) $(EMBEDDINGS_TARGET) $(SAMPLING_TARGET) $(LINEAR_TARGET) $(RESIDUAL_TARGET) $(PIPELINE_TARGET) $(INFERENCE_TARGET)
 	rm -f cublas_matmul.o cublas_int4.o int4_gemv_standalone.o int8_embedding.o $(CUBLAS_TARGET) $(CUBLAS_INT4_TARGET) $(INT4_TARGET)
-	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8 $(BIN_DIR)/test_flash_attention_v2_multi_gpu $(BIN_DIR)/test_flash_attention_v2_optimized
+	rm -f tree_attention.o $(TREE_ATTENTION_TARGET)
+	rm -f eagle_inference.o eagle_weights_init.o edgellm_eagle.o $(EAGLE_TARGET) $(EAGLE_BIN)
+	rm -f lookahead_ngram.o lookahead_state.o lookahead_attention.o $(LOOKAHEAD_NGRAM_TARGET) $(LOOKAHEAD_STATE_TARGET) $(LOOKAHEAD_TARGET) $(LOOKAHEAD_TEST_BIN) $(LOOKAHEAD_ATTN_TARGET) $(LOOKAHEAD_ATTN_TEST_BIN) $(LOOKAHEAD_FULL_TARGET)
+	rm -f edge_cli.o sampling.o inference_with_sampling.o $(EDGE_BIN)
+	rm -f $(BIN_DIR)/test_cuda_kernel $(BIN_DIR)/test_flash_attention $(BIN_DIR)/test_flash_attention_int8 $(BIN_DIR)/test_flash_attention_v2_multi_gpu $(BIN_DIR)/test_flash_attention_v2_optimized $(BIN_DIR)/test_lookahead
 
 # Install to system (optional)
 install: $(TARGET)
@@ -467,8 +657,9 @@ info:
 	@echo "  make jetson-orin - Jetson Orin (sm_87)"
 	@echo "  make rtx        - RTX 30/40 series"
 	@echo ""
-	@echo "Full GPU inference (400+ tok/s target):"
-	@echo "  make cublas     - Build cuBLAS matmul + GQA attention (RECOMMENDED)"
+	@echo "Full GPU inference (80+ tok/s):"
+	@echo "  make edge       - Build 'edge' CLI (RECOMMENDED for users)"
+	@echo "  make cublas     - Build cuBLAS matmul + GQA attention"
 	@echo "  make gpu-inference - Build complete GPU inference library"
 	@echo ""
 	@echo "Inference pipeline targets:"
@@ -483,6 +674,14 @@ info:
 	@echo "  make inference-unified  - Build unified inference library"
 	@echo "  make inference-pipeline - Build complete pipeline"
 	@echo ""
+	@echo "Speculative decoding targets:"
+	@echo "  make eagle      - Build EAGLE speculative decoding (requires draft model)"
+	@echo "  make lookahead  - Build Lookahead decoding Phase 1 (training-free)"
+	@echo "  make lookahead-attention - Build Lookahead attention Phase 2"
+	@echo "  make lookahead-full - Build complete Lookahead system (RECOMMENDED)"
+	@echo "  make lookahead-ngram - Build N-gram pool only"
+	@echo "  make lookahead-state - Build state management only"
+	@echo ""
 	@echo "Test targets:"
 	@echo "  make test       - Run T-MAC kernel tests"
 	@echo "  make test-flash - Run Flash Attention tests (FP32)"
@@ -490,5 +689,8 @@ info:
 	@echo "  make test-fa2-accuracy - Run FA2 accuracy tests"
 	@echo "  make test-fa2-opt      - Run Optimized FA2 tests"
 	@echo "  make test-fa2-multi-gpu - Run Multi-GPU FA2 tests"
+	@echo "  make test-lookahead    - Run Lookahead Phase 1 tests"
+	@echo "  make test-lookahead-attention - Run Lookahead attention tests"
+	@echo "  make test-lookahead-all - Run all Lookahead tests"
 	@echo "  make test-all   - Run all tests"
 	@echo "  make test-all-multi-gpu - Run all tests including multi-GPU"
